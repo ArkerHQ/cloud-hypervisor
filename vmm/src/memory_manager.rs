@@ -844,77 +844,211 @@ impl MemoryManager {
             return Ok(());
         }
 
-        // Open (read only) the snapshot file.
-        let mut memory_file = OpenOptions::new()
-            .read(true)
-            .open(file_path)
-            .map_err(Error::SnapshotOpen)?;
-
-        let guest_memory = self.guest_memory.memory();
+        // CHNESTED L1: parallel prefault. Split the snapshot into fixed-size
+        // work units spanning all saved regions and copy them concurrently.
+        // Each worker opens its own fd (seek is stateful) and writes disjoint
+        // guest-physical ranges, so guest memory needs no locking.
+        const CHUNK: u64 = 64 << 20;
+        let mut units: Vec<(u64, u64, u64)> = Vec::new(); // (gpa, file_off, len)
         let mut file_cursor: u64 = 0;
-
         for range in saved_regions.regions() {
-            let end = file_cursor + range.length;
+            let mut off: u64 = 0;
+            while off < range.length {
+                let len = std::cmp::min(CHUNK, range.length - off);
+                units.push((range.gpa + off, file_cursor + off, len));
+                off += len;
+            }
+            file_cursor += range.length;
+        }
 
-            // First call doubles as a SEEK_HOLE-support probe. On error,
-            // take the dense path which seeks-and-streams sequentially.
-            match next_data_extent(memory_file.as_fd(), file_cursor, end) {
-                Ok(mut next) => {
-                    while let Some((data_off, ext_len)) = next {
-                        debug_assert!(data_off >= file_cursor);
-                        let in_region = data_off
-                            .checked_sub(file_cursor)
-                            .expect("extent precedes file_cursor");
-                        memory_file
-                            .seek(SeekFrom::Start(data_off))
-                            .map_err(Error::SnapshotRead)?;
-                        let mut done: u64 = 0;
-                        while done < ext_len {
-                            let n = guest_memory
-                                .read_volatile_from(
-                                    GuestAddress(range.gpa + in_region + done),
-                                    &mut memory_file,
-                                    (ext_len - done) as usize,
-                                )
-                                .map_err(Error::SnapshotCopy)?;
-                            if n == 0 {
-                                return Err(Error::SnapshotRead(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "read_volatile_from returned 0 inside data extent",
-                                )));
-                            }
-                            done += n as u64;
-                        }
-                        next = next_data_extent(memory_file.as_fd(), data_off + ext_len, end)
-                            .map_err(Error::SnapshotRead)?;
-                    }
-                }
-                Err(_) => {
-                    memory_file
-                        .seek(SeekFrom::Start(file_cursor))
-                        .map_err(Error::SnapshotRead)?;
-                    let mut offset: u64 = 0;
-                    // Manual partial-read loop preserves the workaround for
-                    // https://github.com/rust-vmm/vm-memory/issues/174
+        let nthreads = std::cmp::min(
+            units.len().max(1),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
+        );
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let units_ref = &units;
+        let path_ref = file_path.as_path();
+        let guest_memory = self.guest_memory.clone();
+
+        std::thread::scope(|scope| -> Result<(), Error> {
+            let mut handles = Vec::new();
+            for _ in 0..nthreads {
+                let cursor_ref = &cursor;
+                let gm = guest_memory.clone();
+                handles.push(scope.spawn(move || -> Result<(), Error> {
+                    let mut memory_file = OpenOptions::new()
+                        .read(true)
+                        .open(path_ref)
+                        .map_err(Error::SnapshotOpen)?;
+                    let mem = gm.memory();
                     loop {
-                        let bytes_read = guest_memory
-                            .read_volatile_from(
-                                GuestAddress(range.gpa + offset),
-                                &mut memory_file,
-                                (range.length - offset) as usize,
-                            )
-                            .map_err(Error::SnapshotCopy)?;
-                        offset += bytes_read as u64;
-                        if offset == range.length {
+                        let i = cursor_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= units_ref.len() {
                             break;
                         }
+                        let (gpa, file_off, len) = units_ref[i];
+                        let end = file_off + len;
+                        match next_data_extent(memory_file.as_fd(), file_off, end) {
+                            Ok(mut next) => {
+                                while let Some((data_off, ext_len)) = next {
+                                    let in_region = data_off - file_off;
+                                    memory_file
+                                        .seek(SeekFrom::Start(data_off))
+                                        .map_err(Error::SnapshotRead)?;
+                                    let mut done: u64 = 0;
+                                    while done < ext_len {
+                                        let n = mem
+                                            .read_volatile_from(
+                                                GuestAddress(gpa + in_region + done),
+                                                &mut memory_file,
+                                                (ext_len - done) as usize,
+                                            )
+                                            .map_err(Error::SnapshotCopy)?;
+                                        if n == 0 {
+                                            return Err(Error::SnapshotRead(io::Error::new(
+                                                io::ErrorKind::UnexpectedEof,
+                                                "read_volatile_from returned 0 inside data extent",
+                                            )));
+                                        }
+                                        done += n as u64;
+                                    }
+                                    next = next_data_extent(
+                                        memory_file.as_fd(),
+                                        data_off + ext_len,
+                                        end,
+                                    )
+                                    .map_err(Error::SnapshotRead)?;
+                                }
+                            }
+                            Err(_) => {
+                                memory_file
+                                    .seek(SeekFrom::Start(file_off))
+                                    .map_err(Error::SnapshotRead)?;
+                                let mut offset: u64 = 0;
+                                loop {
+                                    let bytes_read = mem
+                                        .read_volatile_from(
+                                            GuestAddress(gpa + offset),
+                                            &mut memory_file,
+                                            (len - offset) as usize,
+                                        )
+                                        .map_err(Error::SnapshotCopy)?;
+                                    offset += bytes_read as u64;
+                                    if offset == len {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(Error::SnapshotRead(io::Error::new(
+                            io::ErrorKind::Other,
+                            "fill_saved_regions worker panicked",
+                        )))
                     }
                 }
             }
+            Ok(())
+        })
+    }
 
-            file_cursor = end;
+    /// CHNESTED L2: restore by MAP_PRIVATE mmap of the golden snapshot file over
+    /// each guest region + parallel read-only prefault. Clean pages become the
+    /// shared page-cache pages (COW across forks = density); writes go private.
+    /// Prefault (MADV_POPULATE_READ) makes every page present before resume so a
+    /// nested L2 VMRESUME never races a not-yet-present page. Opt-in: ARKER_CH_COW=1.
+    fn restore_by_cow_mmap(
+        &mut self,
+        file_path: &Path,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        use std::os::fd::AsRawFd;
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+        let guest_memory = self.guest_memory.memory();
+        let file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+        let fd = file.as_raw_fd();
+
+        let mut segs: Vec<(u64, u64)> = Vec::new();
+        let mut file_offset: u64 = 0;
+        for range in saved_regions.regions() {
+            let host_addr = (guest_memory
+                .get_host_address(GuestAddress(range.gpa))
+                .map_err(|_| {
+                    Error::SnapshotRead(io::Error::new(
+                        io::ErrorKind::Other,
+                        "cow_mmap gpa translation failed",
+                    ))
+                })? as u64) as *mut libc::c_void;
+            // SAFETY: overmapping the region's own VA range with a private file
+            // mapping; KVM memslot userspace_addr is unchanged.
+            let res = unsafe {
+                libc::mmap(
+                    host_addr,
+                    range.length as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    fd,
+                    file_offset as libc::off_t,
+                )
+            };
+            if res == libc::MAP_FAILED {
+                return Err(Error::SnapshotRead(io::Error::last_os_error()));
+            }
+            segs.push((host_addr as u64, range.length));
+            file_offset += range.length;
         }
 
+        const CHUNK: u64 = 64 << 20;
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        let mut units: Vec<(u64, u64)> = Vec::new();
+        for (base, length) in &segs {
+            let mut off: u64 = 0;
+            while off < *length {
+                let len = std::cmp::min(CHUNK, *length - off);
+                units.push((base + off, len));
+                off += len;
+            }
+        }
+        let nthreads = std::cmp::min(
+            units.len().max(1),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
+        );
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let units_ref = &units;
+        std::thread::scope(|scope| {
+            for _ in 0..nthreads {
+                let cursor_ref = &cursor;
+                scope.spawn(move || loop {
+                    let i = cursor_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= units_ref.len() {
+                        break;
+                    }
+                    let (addr, len) = units_ref[i];
+                    // SAFETY: addr/len lie within our just-established mappings.
+                    unsafe {
+                        libc::madvise(
+                            addr as *mut libc::c_void,
+                            len as usize,
+                            MADV_POPULATE_READ,
+                        );
+                    }
+                });
+            }
+        });
+        drop(file);
         Ok(())
     }
 
@@ -1789,6 +1923,10 @@ impl MemoryManager {
                     &mem_snapshot.memory_ranges,
                     exit_evt,
                 )?;
+            } else if std::env::var("ARKER_CH_COW").as_deref() == Ok("1") {
+                mm.lock()
+                    .unwrap()
+                    .restore_by_cow_mmap(&memory_file_path, &mem_snapshot.memory_ranges)?;
             } else {
                 mm.lock()
                     .unwrap()
@@ -2551,6 +2689,7 @@ impl MemoryManager {
 
             for region in memory_zone.regions() {
                 if snapshot
+                    && !arker_cow_enabled()
                     && let Some(file_offset) = region.file_offset()
                     && (region.flags() & libc::MAP_SHARED == libc::MAP_SHARED)
                     && Self::is_hardlink(file_offset.file())
@@ -3073,6 +3212,31 @@ impl Snapshottable for MemoryManager {
     }
 }
 
+/// ARKER: true when this VMM restored its guest RAM via `restore_by_cow_mmap`
+/// (`ARKER_CH_COW=1`), i.e. every region was overmapped `MAP_PRIVATE|MAP_FIXED`
+/// from the snapshot file.
+///
+/// This INVALIDATES the precondition of upstream's two backing-file
+/// optimisations. Both test `region.flags() & MAP_SHARED`, but `flags()`
+/// reports what the MemoryManager recorded when it CREATED the region — our
+/// `MAP_FIXED` overmap never updates it. So upstream still believes the region
+/// is a shared file mapping whose writes land in the backing file, when in
+/// reality guest writes go to anonymous COW pages the file never sees.
+///
+/// Consequences, both measured on a live Windows guest:
+///   * `memory_range_table(snapshot=true)` SKIPS the region ("we can assume the
+///     user will have it saved through the backing file already").
+///   * `send()` copies from `file_offset.file()` via SEEK_DATA/SEEK_HOLE
+///     instead of from guest memory.
+/// Net effect: `ch-remote snapshot` produced an 8 GiB `memory-ranges` with
+/// `set_len` applied and ZERO extents written — a forked child restored
+/// all-zero RAM, triple-faulted on both vCPUs and cold-booted, losing every
+/// byte of parent state. Under COW the ONLY authoritative source is the guest
+/// VA, so force the dense `write_volatile_to` path that reads it.
+fn arker_cow_enabled() -> bool {
+    std::env::var("ARKER_CH_COW").as_deref() == Ok("1")
+}
+
 /// Write a single guest RAM region to the snapshot file at `dst_offset`,
 /// streaming populated extents via `SEEK_DATA` / `SEEK_HOLE` on the
 /// backing fd. `set_len(total)` must have been called on `dst` by the
@@ -3183,6 +3347,7 @@ impl Transportable for MemoryManager {
         for range in self.snapshot_memory_ranges.regions() {
             let mut wrote_sparse = false;
             if sparse_layout
+                && !arker_cow_enabled()
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
                 && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
                 && let Some(file_offset) = region.file_offset()
@@ -3233,6 +3398,15 @@ impl Transportable for MemoryManager {
         }
 
         debug_assert_eq!(file_cursor, total_len);
+        // ARKER: the empty-snapshot bug was invisible for a long time because
+        // nothing reported how many bytes a snapshot actually captured. Say so.
+        eprintln!(
+            "CHSNAP send: regions={} bytes_written={} cow_mode={} dest={}",
+            self.snapshot_memory_ranges.regions().len(),
+            file_cursor,
+            arker_cow_enabled(),
+            memory_file_path.display(),
+        );
         Ok(())
     }
 }
