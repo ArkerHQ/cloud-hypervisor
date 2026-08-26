@@ -1899,7 +1899,15 @@ impl RequestHandler for Vmm {
 
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
-            vm.resume().map_err(VmError::Resume)
+            vm.resume().map_err(VmError::Resume)?;
+            // CHDIRTY: verify KVM dirty-logging works on the nested guest.
+            if std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1") {
+                match vm.start_dirty_log() {
+                    Ok(()) => eprintln!("CHDIRTY start_dirty_log OK (nested dirty tracking armed)"),
+                    Err(e) => eprintln!("CHDIRTY start_dirty_log FAILED: {:?}", e),
+                }
+            }
+            Ok(())
         } else {
             Err(VmError::VmNotRunning)
         }
@@ -1909,6 +1917,21 @@ impl RequestHandler for Vmm {
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
+            // CHDIRTY: report the dirty-page set (delta vs restore point) on nested.
+            if std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1") {
+                match vm.dirty_log() {
+                    Ok(table) => {
+                        let pages: u64 =
+                            table.regions().iter().map(|r| r.length).sum::<u64>() / 4096;
+                        eprintln!(
+                            "CHDIRTY dirty_log OK total_dirty_pages={} total_MB={}",
+                            pages,
+                            pages * 4096 / 1048576
+                        );
+                    }
+                    Err(e) => eprintln!("CHDIRTY dirty_log FAILED: {:?}", e),
+                }
+            }
             vm.snapshot()
                 .map_err(VmError::Snapshot)
                 .and_then(|snapshot| {

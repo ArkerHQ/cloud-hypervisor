@@ -1587,6 +1587,33 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
         #[cfg(target_arch = "x86_64")]
         {
+            // ARKER nested-migration parity: enable the two KVM caps QEMU enables on
+            // Intel so a live nested guest (L2) survives CH snapshot/restore.
+            //   EXCEPTION_PAYLOAD (164): a pending exception at the L1->L2 boundary is
+            //     migrated as exception.pending(+payload), not folded into injected.
+            //   X86_TRIPLE_FAULT_EVENT (218): a pending nested triple-fault (shutdown)
+            //     round-trips via vcpu_events instead of being silently lost.
+            // VM-scoped, enabled before any vCPU exists. Best-effort: a host/kernel
+            // without the cap simply keeps the old (non-nested-migratable) behavior.
+            for arker_cap in [
+                kvm_bindings::KVM_CAP_EXCEPTION_PAYLOAD,
+                kvm_bindings::KVM_CAP_X86_TRIPLE_FAULT_EVENT,
+            ] {
+                let arker_ec = kvm_bindings::kvm_enable_cap {
+                    cap: arker_cap,
+                    args: [1, 0, 0, 0],
+                    ..Default::default()
+                };
+                if let Err(e) = fd.enable_cap(&arker_ec) {
+                    warn!(
+                        "ARKER: nested-migration cap {} enable failed (non-fatal): {:?}",
+                        arker_cap, e
+                    );
+                } else {
+                    eprintln!("CHNESTED enabled nested-migration cap {}", arker_cap);
+                }
+            }
+
             let msr_list = self.get_msr_list()?;
             let num_msrs = msr_list.as_fam_struct_ref().nmsrs as usize;
             let mut msrs = vec![
@@ -3113,9 +3140,6 @@ impl cpu::Vcpu for KvmVcpu {
         self.set_xcrs(&state.xcrs)?;
         self.set_lapic(&state.lapic_state)?;
         self.set_fpu(&state.fpu)?;
-        if let Some(nested_state) = state.nested_state {
-            self.set_nested_state(&nested_state)?;
-        }
 
         if let Some(freq) = state.tsc_khz {
             self.set_tsc_khz(freq)?;
@@ -3156,7 +3180,27 @@ impl cpu::Vcpu for KvmVcpu {
             }
         }
 
+        // QEMU-canonical nested-migration order (target/i386/kvm/kvm.c,
+        // kvm_arch_put_registers): after MSRs (EFER + IA32_FEATURE_CONTROL + VMX-cap
+        // MSRs in place), apply VCPU_EVENTS *then* NESTED_STATE. KVM's
+        // vmx_set_nested_state() validates against HF_SMM_MASK and the pending
+        // exception / triple-fault -- all established by SET_VCPU_EVENTS. Applying
+        // nested_state first fails -EINVAL or rebuilds vmcs02 from stale event state
+        // (the kvm_spurious_fault we chased). QEMU flipped to this order in 2023.
+        {
+            let has_featctl = state.msrs.iter().any(|m| m.index == 0x0000_003a);
+            eprintln!(
+                "CHNESTED set_state nested_is_some={} feature_control_in_msrs={} nmsrs={}",
+                state.nested_state.is_some(),
+                has_featctl,
+                state.msrs.len()
+            );
+        }
         self.set_vcpu_events(&state.vcpu_events)?;
+        if let Some(nested_state) = state.nested_state {
+            self.set_nested_state(&nested_state)?;
+            eprintln!("CHNESTED set_nested_state OK (after vcpu_events)");
+        }
 
         Ok(())
     }
@@ -3167,6 +3211,7 @@ impl cpu::Vcpu for KvmVcpu {
     #[cfg(target_arch = "aarch64")]
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
+        eprintln!("CHNESTED set_state nested_is_some={}", state.nested_state.is_some());
         // Set core registers
         self.set_regs(&state.core_regs.into())?;
         // Set system registers
@@ -3187,6 +3232,7 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
+        eprintln!("CHNESTED set_state nested_is_some={}", state.nested_state.is_some());
         // Set core registers
         self.set_regs(&state.core_regs.into())?;
         // Set system registers
@@ -3585,16 +3631,34 @@ impl KvmVcpu {
             .nested_state(&mut buffer)
             .map_err(|e| cpu::HypervisorCpuError::GetNestedState(e.into()))?;
 
+        eprintln!("CHNESTED GET maybe_size={:?}", maybe_size);
         if let Some(_size) = maybe_size {
             Ok(Some(buffer))
         } else {
-            Ok(None)
+            // CHNESTED FIX: kvm-ioctls collapses a header-only response into None,
+            // but header-only is MEANINGFUL when the guest executed VMXON without a
+            // currently-loaded VMCS (hdr.vmx.vmxon_pa != -1). Dropping it restores
+            // the vCPU with vmxon=false, so the guest kernel's next VMPTRLD faults
+            // (#UD) -> kvm_spurious_fault -> vCPU wedge (AVD L2 hang after restore).
+            // Preserve the vmxon-only header so SET_NESTED_STATE re-enters VMX
+            // operation on restore. format 0 == KVM_STATE_NESTED_FORMAT_VMX.
+            let vmxon_pa = unsafe { buffer.hdr.vmx.vmxon_pa };
+            if buffer.format == 0 && vmxon_pa != u64::MAX {
+                eprintln!(
+                    "CHNESTED GET header-only vmxon_pa={:#x} -> preserving vmxon-only state",
+                    vmxon_pa
+                );
+                Ok(Some(buffer))
+            } else {
+                Ok(None)
+            }
         }
     }
 
     /// Sets the state of the nested guest for the current vCPU.
     #[cfg(target_arch = "x86_64")]
     fn set_nested_state(&self, state: &KvmNestedStateBuffer) -> cpu::Result<()> {
+        eprintln!("CHNESTED SET nested_state called");
         self.fd
             .set_nested_state(state)
             .map_err(|e| cpu::HypervisorCpuError::GetNestedState(e.into()))
