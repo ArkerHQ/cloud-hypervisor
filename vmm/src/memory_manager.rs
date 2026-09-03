@@ -3356,6 +3356,24 @@ fn arker_delta_enabled() -> bool {
     matches!(std::env::var("ARKER_CH_DELTA").ok().as_deref(), Some("1"))
 }
 
+/// Report a delta line to BOTH stderr and a fixed path.
+///
+/// The VMM's stderr goes to `<vm_dir>/ch-restore-stderr.log`, which dies with
+/// the VM directory -- and the harness deletes its VMs as soon as a test ends,
+/// so a report that only reaches stderr is unreadable by the time anyone looks.
+/// Four diagnostic runs produced no output for exactly that reason.
+fn arker_delta_report(line: &str) {
+    eprintln!("{line}");
+    use std::io::Write as _;
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/chdelta.log")
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Reflink `src` onto `dst`. XFS on /data is `reflink=1`, so this is O(1) and
 /// shares extents; a plain copy would defeat the entire point.
 fn arker_ficlone(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -3622,10 +3640,10 @@ impl Transportable for MemoryManager {
                             }
                             off += PAGE as u64;
                         }
-                        eprintln!(
+                        arker_delta_report(&format!(
                             "CHDELTA_VERIFY: pages_compared={} pages_differ={} verify_ms={:.1} first_diffs={:?}",
                             compared, differ, t_v.elapsed().as_secs_f64() * 1000.0, first
-                        );
+                        ));
                     } else {
                         eprintln!("CHDELTA_VERIFY: reference dump failed — no verdict");
                     }
@@ -3635,13 +3653,13 @@ impl Transportable for MemoryManager {
             }
         }
         if arker_delta_active {
-            eprintln!(
+            arker_delta_report(&format!(
                 "CHDELTA send: wrote_MB={} skipped_MB={} total_MB={} base={}",
                 arker_written / 1048576,
                 arker_skipped / 1048576,
                 total_len / 1048576,
                 arker_base.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            );
+            ));
         }
         debug_assert_eq!(file_cursor, total_len);
         // ARKER: the empty-snapshot bug was invisible for a long time because
