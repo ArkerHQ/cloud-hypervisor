@@ -3447,6 +3447,17 @@ impl Transportable for MemoryManager {
         // `memory-ranges`, so a base already exists even for a first capture).
         let arker_base = std::env::var("ARKER_CH_SNAP_BASE").ok().map(PathBuf::from);
         let mut arker_delta_active = false;
+        // Report the DECISION unconditionally when the feature is on. Silence
+        // was ambiguous: an empty log read identically as "delta ran and said
+        // nothing", "the base was rejected", and "the env never arrived".
+        if arker_delta_enabled() {
+            arker_delta_report(&format!(
+                "CHDELTA decide: published={} base={:?} total_len={}",
+                arker_delta.is_some(),
+                arker_base.as_ref().map(|p| p.display().to_string()),
+                total_len
+            ));
+        }
         if let (Some(_), Some(base)) = (arker_delta.as_ref(), arker_base.as_ref()) {
             // The base must describe the SAME dense layout, or the `set_len` below
             // would truncate the reflinked image and the offsets we write into it
@@ -3455,9 +3466,9 @@ impl Transportable for MemoryManager {
             // memory topology is unchanged. Any mismatch => dense dump.
             let base_len = std::fs::metadata(base).map(|m| m.len()).unwrap_or(0);
             if base_len != total_len {
-                eprintln!(
-                    "CHDELTA base size {base_len} != total {total_len} — dense dump"
-                );
+                arker_delta_report(&format!(
+                    "CHDELTA skip: base_len={base_len} total_len={total_len} (size mismatch) — dense dump"
+                ));
             } else if base.is_file() {
                 match arker_ficlone(base, &memory_file_path) {
                     Ok(()) => arker_delta_active = true,
@@ -3465,7 +3476,9 @@ impl Transportable for MemoryManager {
                         // Reflink failed (wrong fs, cross-device, ENOTSUP).
                         // Dense dump below is still correct.
                         let _ = std::fs::remove_file(&memory_file_path);
-                        eprintln!("CHDELTA ficlone FAILED ({e}) — falling back to dense dump");
+                        arker_delta_report(&format!(
+                            "CHDELTA skip: ficlone failed ({e}) — dense dump"
+                        ));
                     }
                 }
             }
