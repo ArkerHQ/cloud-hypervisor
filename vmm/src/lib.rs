@@ -1917,21 +1917,45 @@ impl RequestHandler for Vmm {
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
-            // CHDIRTY: report the dirty-page set (delta vs restore point) on nested.
-            if std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1") {
+            // CHDIRTY / CHDELTA: read the dirty set ONCE. `dirty_log()` ends in
+            // `bitmap().get_and_reset()` and clears the KVM half, so it CONSUMES
+            // what it returns -- calling it twice would hand the second caller an
+            // empty set and silently drop those pages from the snapshot. One call,
+            // shared by the probe and the delta.
+            //
+            // Read here, with the vCPUs already paused by the snapshot path, so the
+            // set cannot grow between reading it and writing the memory file.
+            let want_delta = std::env::var("ARKER_CH_DELTA").as_deref() == Ok("1");
+            let want_probe = std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1");
+            if want_delta || want_probe {
                 match vm.dirty_log() {
                     Ok(table) => {
-                        let pages: u64 =
-                            table.regions().iter().map(|r| r.length).sum::<u64>() / 4096;
-                        eprintln!(
-                            "CHDIRTY dirty_log OK total_dirty_pages={} total_MB={}",
-                            pages,
-                            pages * 4096 / 1048576
-                        );
+                        if want_probe {
+                            let pages: u64 =
+                                table.regions().iter().map(|r| r.length).sum::<u64>() / 4096;
+                            eprintln!(
+                                "CHDIRTY dirty_log OK total_dirty_pages={} total_MB={}",
+                                pages,
+                                pages * 4096 / 1048576
+                            );
+                        }
+                        if want_delta {
+                            crate::memory_manager::arker_publish_delta(table);
+                        }
                     }
+                    // No dirty set means no delta: `send` finds nothing published
+                    // and takes the dense path, which is always correct.
                     Err(e) => eprintln!("CHDIRTY dirty_log FAILED: {:?}", e),
                 }
             }
+            // NO re-arm here, deliberately. `ARKER_CH_SNAP_BASE` is fixed for the
+            // life of this process (env is set at spawn), so every snapshot is a
+            // delta against the RESTORE image. Re-arming would make the next read
+            // "dirty since the last snapshot" while the base stayed the restore
+            // image -- silently dropping everything dirtied before that snapshot.
+            // `arker_publish_delta` accumulates instead, so the published set is
+            // always "changed since the base". FC can re-arm because it ADVANCES
+            // its base file (mem.base) in the same paired step; we do not.
             vm.snapshot()
                 .map_err(VmError::Snapshot)
                 .and_then(|snapshot| {

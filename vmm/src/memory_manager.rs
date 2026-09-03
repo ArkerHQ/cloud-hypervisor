@@ -3305,6 +3305,91 @@ fn write_region_sparse(
     Ok(true)
 }
 
+/// ARKER DELTA SNAPSHOT ("refork-delta" for Cloud Hypervisor).
+///
+/// Ported from our Firecracker fork's REFORK_DELTA (c5de1de53): publish a frozen
+/// base once, accumulate a dirty bitmap against it, and make a later re-fork cost
+/// O(delta) by FICLONE'ing the base and laying only the dirty ranges on top.
+/// Nothing changes on the restore side -- the reflinked file is complete, so the
+/// layering happens in the filesystem at capture time, which is what makes this
+/// possible without the base+diff restore support CH does not have.
+///
+/// CH differs from FC in one way that dictates the failure policy.
+/// `MemoryManager::dirty_log()` ends in `bitmap().get_and_reset()`, and
+/// `Vm::get_dirty_log` clears the KVM half -- so READING the log CONSUMES it.
+/// FC can order "advance base STRICTLY BEFORE clear" and treat a crash between
+/// them as (old base, full log) = correct. Here the log is already gone by the
+/// time we write, so the only safe fallback once the delta is in hand is a FULL
+/// dense dump, which is correct precisely because it does not consult the log.
+/// The corrupting state -- old base kept while the log was cleared -- is what
+/// that fallback rules out.
+static ARKER_PENDING_DELTA: std::sync::Mutex<Option<MemoryRangeTable>> =
+    std::sync::Mutex::new(None);
+
+/// Accumulate the dirty set for the snapshot about to run. Called from
+/// `vm_snapshot` with the vCPUs paused, so the set cannot grow underneath the
+/// write below.
+///
+/// ACCUMULATES rather than replaces, and that is load-bearing. CH's
+/// `dirty_log()` clears as it reads, while `ARKER_CH_SNAP_BASE` is fixed for the
+/// process lifetime -- so each read alone is "dirty since the LAST read", but
+/// what `send` needs is "changed since the BASE". Storing only the latest read
+/// would drop every page dirtied before the previous snapshot and produce a
+/// child whose memory is silently stale in exactly those pages.
+pub fn arker_publish_delta(table: MemoryRangeTable) {
+    if let Ok(mut slot) = ARKER_PENDING_DELTA.lock() {
+        let merged = match slot.take() {
+            Some(prev) => {
+                let mut acc = prev;
+                for r in table.regions() {
+                    acc.push(r.clone());
+                }
+                acc
+            }
+            None => table,
+        };
+        *slot = Some(merged);
+    }
+}
+
+fn arker_delta_enabled() -> bool {
+    matches!(std::env::var("ARKER_CH_DELTA").ok().as_deref(), Some("1"))
+}
+
+/// Reflink `src` onto `dst`. XFS on /data is `reflink=1`, so this is O(1) and
+/// shares extents; a plain copy would defeat the entire point.
+fn arker_ficlone(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    const FICLONE_REQ: u64 = 0x4004_9409;
+    let s = File::open(src)?;
+    let d = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    // SAFETY: both descriptors are open regular files owned by this scope; the
+    // ioctl reads no user buffer and returns -1 on failure.
+    let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE_REQ as _, s.as_raw_fd()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Does `gpa..gpa+len` intersect any dirty range? Returns the intersecting
+/// sub-extents in GPA space, so a partially-dirty region writes only its dirty
+/// part rather than being promoted to fully dirty.
+fn arker_dirty_overlaps(dirty: &MemoryRangeTable, gpa: u64, len: u64) -> Vec<(u64, u64)> {
+    let end = gpa + len;
+    let mut out = Vec::new();
+    for d in dirty.regions() {
+        let ds = d.gpa;
+        let de = d.gpa + d.length;
+        let s = ds.max(gpa);
+        let e = de.min(end);
+        if s < e {
+            out.push((s, e - s));
+        }
+    }
+    out
+}
+
 impl Transportable for MemoryManager {
     fn send(
         &self,
@@ -3318,19 +3403,62 @@ impl Transportable for MemoryManager {
         let mut memory_file_path = url_to_path(destination_url)?;
         memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
-        let mut memory_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&memory_file_path)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
+        // Needed by the delta size guard below, so computed before it rather
+        // than after the file is opened.
         let total_len: u64 = self
             .snapshot_memory_ranges
             .regions()
             .iter()
             .map(|r| r.length)
             .sum();
+
+        // ── ARKER DELTA ──────────────────────────────────────────────────
+        // Take the dirty set published by `vm_snapshot` (vCPUs paused). We are
+        // committed once this is taken: reading CH's dirty log CONSUMES it, so
+        // any failure below must fall back to the DENSE dump, never to a delta
+        // against a base we did not manage to lay.
+        // CLONE, never take: the accumulator must survive for the next snapshot,
+        // which is still a delta against the same fixed base.
+        let arker_delta = if arker_delta_enabled() {
+            ARKER_PENDING_DELTA.lock().ok().and_then(|g| g.clone())
+        } else {
+            None
+        };
+        // The frozen base to rebase onto. arkerd points this at the file this
+        // VM was restored from (fork children hardlink the golden's
+        // `memory-ranges`, so a base already exists even for a first capture).
+        let arker_base = std::env::var("ARKER_CH_SNAP_BASE").ok().map(PathBuf::from);
+        let mut arker_delta_active = false;
+        if let (Some(_), Some(base)) = (arker_delta.as_ref(), arker_base.as_ref()) {
+            // The base must describe the SAME dense layout, or the `set_len` below
+            // would truncate the reflinked image and the offsets we write into it
+            // would name different pages. Size equality is the cheap proxy for
+            // "same regions in the same order", which is what holds while the VM's
+            // memory topology is unchanged. Any mismatch => dense dump.
+            let base_len = std::fs::metadata(base).map(|m| m.len()).unwrap_or(0);
+            if base_len != total_len {
+                eprintln!(
+                    "CHDELTA base size {base_len} != total {total_len} — dense dump"
+                );
+            } else if base.is_file() {
+                match arker_ficlone(base, &memory_file_path) {
+                    Ok(()) => arker_delta_active = true,
+                    Err(e) => {
+                        // Reflink failed (wrong fs, cross-device, ENOTSUP).
+                        // Dense dump below is still correct.
+                        let _ = std::fs::remove_file(&memory_file_path);
+                        eprintln!("CHDELTA ficlone FAILED ({e}) — falling back to dense dump");
+                    }
+                }
+            }
+        }
+        let mut memory_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(!arker_delta_active)
+            .create(arker_delta_active)
+            .open(&memory_file_path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Pre-size the file so per-region write_at lands at the dense-layout
         // offset. On filesystems that support sparse files unwritten bytes
@@ -3344,7 +3472,45 @@ impl Transportable for MemoryManager {
         let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
+        let mut arker_written: u64 = 0;
+        let mut arker_skipped: u64 = 0;
         for range in self.snapshot_memory_ranges.regions() {
+            // Delta: the reflinked base already holds this range's bytes. Write
+            // only the sub-extents the guest dirtied since the base was frozen,
+            // at the SAME dense offsets, so the file stays a complete image and
+            // the restore path needs no base+diff support.
+            if arker_delta_active {
+                let dirty = arker_delta.as_ref().expect("active implies present");
+                let overlaps = arker_dirty_overlaps(dirty, range.gpa, range.length);
+                if overlaps.is_empty() {
+                    arker_skipped += range.length;
+                    file_cursor += range.length;
+                    continue;
+                }
+                for (dgpa, dlen) in overlaps {
+                    let at = file_cursor + (dgpa - range.gpa);
+                    memory_file
+                        .seek(SeekFrom::Start(at))
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    let mut off: u64 = 0;
+                    loop {
+                        let n = guest_memory
+                            .write_volatile_to(
+                                GuestAddress(dgpa + off),
+                                &mut memory_file,
+                                (dlen - off) as usize,
+                            )
+                            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                        off += n as u64;
+                        if off == dlen {
+                            break;
+                        }
+                    }
+                    arker_written += dlen;
+                }
+                file_cursor += range.length;
+                continue;
+            }
             let mut wrote_sparse = false;
             if sparse_layout
                 && !arker_cow_enabled()
@@ -3397,6 +3563,15 @@ impl Transportable for MemoryManager {
             file_cursor += range.length;
         }
 
+        if arker_delta_active {
+            eprintln!(
+                "CHDELTA send: wrote_MB={} skipped_MB={} total_MB={} base={}",
+                arker_written / 1048576,
+                arker_skipped / 1048576,
+                total_len / 1048576,
+                arker_base.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            );
+        }
         debug_assert_eq!(file_cursor, total_len);
         // ARKER: the empty-snapshot bug was invisible for a long time because
         // nothing reported how many bytes a snapshot actually captured. Say so.
