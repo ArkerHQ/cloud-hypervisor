@@ -3389,6 +3389,36 @@ fn arker_delta_enabled() -> bool {
 /// the VM directory -- and the harness deletes its VMs as soon as a test ends,
 /// so a report that only reaches stderr is unreadable by the time anyone looks.
 /// Four diagnostic runs produced no output for exactly that reason.
+/// Install a panic hook that appends to the same durable log.
+///
+/// The VMM dies mid-snapshot with "HTTP output is missing protocol statement"
+/// -- ch-remote's view of a process that vanished without answering. A Rust
+/// panic runs none of the error paths this module reports through, and the
+/// default hook writes to stderr, which lands in <vm_dir>/ch-restore-stderr.log
+/// and is deleted with the VM the moment the test ends. So the one failure mode
+/// that matters is the one that leaves no trace. This makes it leave one.
+fn arker_install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| String::from("<unknown>"));
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| String::from("<non-string payload>"));
+            arker_delta_report(&format!("CHDELTA PANIC at {loc}: {msg}"));
+            prev(info);
+        }));
+    });
+}
+
 fn arker_delta_report(line: &str) {
     eprintln!("{line}");
     use std::io::Write as _;
@@ -3399,6 +3429,37 @@ fn arker_delta_report(line: &str) {
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// The dense layout a memory image was written with, as `gpa:len` lines.
+///
+/// The delta overwrites bytes at offsets derived from the CURRENT range table
+/// while the base file was written with the SOURCE's table. Equal total size
+/// does not imply equal layout: `memory_range_table` emits a virtio-mem zone's
+/// `plugged_ranges()` BEFORE that zone's regions, and arkerd both configures
+/// `hotplug_method=virtio-mem` and re-issues `resize --memory` on every /run --
+/// so the same plugged TOTAL with a different plugged block set produces the
+/// same length and a different layout. Zone iteration is a HashMap too, whose
+/// order is randomised per process once there is more than one zone.
+///
+/// Writing the layout beside the image turns that from an assumption into a
+/// check: the delta is only sound when the base's layout matches ours exactly.
+fn arker_layout_string(table: &MemoryRangeTable) -> String {
+    let mut out = String::new();
+    for r in table.regions() {
+        out.push_str(&format!("{}:{}\n", r.gpa, r.length));
+    }
+    out
+}
+
+fn arker_layout_path(image: &Path) -> PathBuf {
+    let mut p = image.to_path_buf();
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("memory-ranges"));
+    p.set_file_name(format!("{name}.layout"));
+    p
 }
 
 /// Reflink `src` onto `dst`. XFS on /data is `reflink=1`, so this is O(1) and
@@ -3478,6 +3539,7 @@ impl Transportable for MemoryManager {
         // was ambiguous: an empty log read identically as "delta ran and said
         // nothing", "the base was rejected", and "the env never arrived".
         if arker_delta_enabled() {
+            arker_install_panic_hook();
             arker_delta_report(&format!(
                 "CHDELTA decide: published={} dirty_ranges={} dirty_MB={} regions={} base={:?} total_len={}",
                 arker_delta.is_some(),
@@ -3519,6 +3581,22 @@ impl Transportable for MemoryManager {
                     too_dirty,
                     too_scattered
                 ));
+            } else if {
+                // Layout equality, not just size. A missing sidecar means the
+                // base predates this check, which is exactly when we must not
+                // assume.
+                let want = arker_layout_string(&self.snapshot_memory_ranges);
+                let got = std::fs::read_to_string(arker_layout_path(base)).unwrap_or_default();
+                let mismatch = got != want;
+                if mismatch {
+                    arker_delta_report(&format!(
+                        "CHDELTA skip: base layout {} — dense dump",
+                        if got.is_empty() { "absent" } else { "differs" }
+                    ));
+                }
+                mismatch
+            } {
+                // reported above
             } else if base_len != total_len {
                 arker_delta_report(&format!(
                     "CHDELTA skip: base_len={base_len} total_len={total_len} (size mismatch) — dense dump"
@@ -3768,6 +3846,11 @@ impl Transportable for MemoryManager {
                 arker_base.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             ));
         }
+        // Record the layout beside the image for the next delta to verify.
+        let _ = std::fs::write(
+            arker_layout_path(&memory_file_path),
+            arker_layout_string(&self.snapshot_memory_ranges),
+        );
         debug_assert_eq!(file_cursor, total_len);
         // ARKER: the empty-snapshot bug was invisible for a long time because
         // nothing reported how many bytes a snapshot actually captured. Say so.
