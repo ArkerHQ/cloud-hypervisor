@@ -3475,7 +3475,49 @@ fn arker_ficlone(src: &Path, dst: &Path) -> std::io::Result<()> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // DEFER THE CLOSE. This is the Firecracker lesson (our fork, 27ff189d8):
+    // close() on a large snapshot memory file measured 1191.9ms -- 44% of the
+    // whole operation -- because XFS trims speculative extent preallocation on
+    // LAST CLOSE. Here it is worse: `src` is itself a reflinked, scattered-patched
+    // image, so the extent map being duplicated and then reconciled is large, and
+    // the close happens INSIDE the snapshot HTTP handler. The VMM stops answering,
+    // ch-remote reports "HTTP output is missing protocol statement", arkerd times
+    // the snapshot out and reaps the VM -- which is exactly the shape observed:
+    // 'CHDELTA decide' logged, no 'ficlone ok', no panic, no signal.
+    //
+    // Nothing depends on this descriptor closing first: the ioctl has returned, so
+    // the clone is durable in the filesystem, and the writes below go through the
+    // separate fd `send()` opens.
+    arker_close_deferred(d);
     Ok(())
+}
+
+/// Hand a `File` to a background thread to be closed.
+///
+/// BOUNDED (64) with an inline fallback when full or the worker is gone. FC's
+/// note applies verbatim: an unbounded queue would trade close latency for an fd
+/// leak under fork storms, which is the worse bug.
+fn arker_close_deferred(f: File) {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    static TX: OnceLock<SyncSender<File>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = sync_channel::<File>(64);
+        std::thread::Builder::new()
+            .name("arker-close".into())
+            .spawn(move || {
+                while let Ok(f) = rx.recv() {
+                    drop(f);
+                }
+            })
+            .ok();
+        tx
+    });
+    if let Err(std::sync::mpsc::TrySendError::Full(f))
+    | Err(std::sync::mpsc::TrySendError::Disconnected(f)) = tx.try_send(f)
+    {
+        drop(f);
+    }
 }
 
 /// Does `gpa..gpa+len` intersect any dirty range? Returns the intersecting
@@ -3848,6 +3890,12 @@ impl Transportable for MemoryManager {
                 arker_t0.elapsed().as_secs_f64() * 1000.0,
                 arker_base.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             ));
+        }
+        // Same deferred close for the fd we wrote through: on the delta path this
+        // file is a reflink with a freshly-fragmented extent map, which is the
+        // expensive case for XFS's last-close trim.
+        if arker_delta_active {
+            arker_close_deferred(memory_file);
         }
         // Record the layout beside the image for the next delta to verify.
         let _ = std::fs::write(
