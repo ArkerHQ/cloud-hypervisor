@@ -1900,11 +1900,28 @@ impl RequestHandler for Vmm {
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             vm.resume().map_err(VmError::Resume)?;
-            // CHDIRTY: verify KVM dirty-logging works on the nested guest.
-            if std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1") {
+            // Arm dirty tracking ONCE per process, not on every resume.
+            //
+            // `MemoryManager::start_dirty_log` RESETS every region bitmap, and
+            // arkerd resumes after each snapshot (plus the eager-pause
+            // dispatcher pauses/resumes independently). Re-arming there would
+            // wipe every host-side bit recorded since the last `dirty_log()`
+            // read -- which is precisely the set the delta path accumulates,
+            // because ARKER_CH_SNAP_BASE is fixed for the process lifetime and
+            // the delta must stay "changed since the BASE", not "since the last
+            // resume". The KVM half is unaffected either way (re-arming with
+            // identical flags is a no-op), so this only protects the VMM half.
+            static ARKER_DIRTY_ARMED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1")
+                && !ARKER_DIRTY_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
                 match vm.start_dirty_log() {
-                    Ok(()) => eprintln!("CHDIRTY start_dirty_log OK (nested dirty tracking armed)"),
-                    Err(e) => eprintln!("CHDIRTY start_dirty_log FAILED: {:?}", e),
+                    Ok(()) => eprintln!("CHDIRTY start_dirty_log OK (armed once)"),
+                    Err(e) => {
+                        ARKER_DIRTY_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+                        eprintln!("CHDIRTY start_dirty_log FAILED: {:?}", e);
+                    }
                 }
             }
             Ok(())

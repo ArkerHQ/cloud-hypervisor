@@ -262,6 +262,16 @@ impl RxVirtio {
                             .get_slice(desc_addr, desc.len() as usize)
                             .map_err(NetQueuePairError::GuestMemory)?;
                         assert!(buf.len() >= desc.len() as usize);
+                        // RX: the KERNEL writes this range via readv below, through a raw
+                        // pointer the dirty bitmap does not observe (vm-memory's own note on
+                        // ptr_guard_mut). Live migration tolerates that because it ends in a
+                        // full stop-and-copy; an incremental snapshot trusting the log as
+                        // complete does not, and its child keeps the BASE's stale RX bytes.
+                        // Marked for the whole descriptor: the actual readv length is not
+                        // known until after the call, and over-marking only costs delta size.
+                        // The TX site above is `!is_write_only` -- the device READS there, so
+                        // it needs no marking.
+                        buf.bitmap().mark_dirty(0, desc.len() as usize);
                         let buf = buf.ptr_guard_mut();
                         let iovec = libc::iovec {
                             iov_base: buf.as_ptr().cast(),

@@ -3520,22 +3520,45 @@ impl Transportable for MemoryManager {
                 }
                 for (dgpa, dlen) in overlaps {
                     let at = file_cursor + (dgpa - range.gpa);
-                    memory_file
-                        .seek(SeekFrom::Start(at))
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    if let Err(e) = memory_file.seek(SeekFrom::Start(at)) {
+                        arker_delta_report(&format!(
+                            "CHDELTA write: seek to {at} failed: {e}"
+                        ));
+                        return Err(MigratableError::MigrateSend(e.into()));
+                    }
                     let mut off: u64 = 0;
-                    loop {
-                        let n = guest_memory
-                            .write_volatile_to(
-                                GuestAddress(dgpa + off),
-                                &mut memory_file,
-                                (dlen - off) as usize,
-                            )
-                            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                        off += n as u64;
-                        if off == dlen {
-                            break;
+                    while off < dlen {
+                        let n = match guest_memory.write_volatile_to(
+                            GuestAddress(dgpa + off),
+                            &mut memory_file,
+                            (dlen - off) as usize,
+                        ) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                arker_delta_report(&format!(
+                                    "CHDELTA write: gpa={dgpa:#x} off={off} len={dlen} failed: {e}"
+                                ));
+                                return Err(MigratableError::MigrateSend(e.into()));
+                            }
+                        };
+                        // NO-PROGRESS GUARD. `write_volatile_to` may legally
+                        // return Ok(0); the upstream dense loop has the same
+                        // shape and never trips it because it writes whole
+                        // regions, but a partial extent can land on a boundary
+                        // that does. Without this the VMM spins forever holding
+                        // its state lock -- from outside that is indistinguishable
+                        // from a crash: `ch-remote info` stops answering, the
+                        // snapshot fails, and the fork's child is unusable. That
+                        // is exactly the failure this path produced.
+                        if n == 0 {
+                            arker_delta_report(&format!(
+                                "CHDELTA write: no progress at gpa={dgpa:#x} off={off} len={dlen} — aborting to avoid a spin"
+                            ));
+                            return Err(MigratableError::MigrateSend(anyhow!(
+                                "delta write made no progress at gpa {dgpa:#x} offset {off}"
+                            )));
                         }
+                        off += n as u64;
                     }
                     arker_written += dlen;
                 }

@@ -19,6 +19,7 @@ use std::ops::Deref;
 
 use byteorder::{ByteOrder, LittleEndian};
 use virtio_queue::DescriptorChain;
+use vm_memory::bitmap::Bitmap;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 use vm_virtio::{AccessPlatform, Translatable};
 
@@ -110,6 +111,36 @@ pub struct VsockPacket {
     guest_hdr_addr: GuestAddress,
     hdr: [u8; VSOCK_PKT_HDR_SIZE],
     buf: Option<PacketBuffer>,
+}
+
+/// Mark a guest-RAM range dirty that the VMM is about to write through a RAW
+/// POINTER.
+///
+/// `get_host_address_range` hands out a `*mut u8` obtained from
+/// `ptr_guard_mut()`, and vm-memory is explicit that "mutable accesses performed
+/// using the resulting pointer are not automatically accounted for by the dirty
+/// bitmap tracking functionality". `PtrGuardMut` has no Drop that marks either.
+/// So an RX payload written through that pointer is INVISIBLE to both halves of
+/// the dirty oracle: KVM's log only sees guest writes, and the vm-memory
+/// AtomicBitmap only sees writes made through GuestMemory accessors.
+///
+/// Harmless for live migration, which follows dirty tracking with a final
+/// stop-and-copy of everything. NOT harmless for an incremental snapshot that
+/// trusts the log as complete: the child keeps the BASE's stale bytes for these
+/// pages, and since the vsock header IS tracked (`commit_hdr` goes through
+/// `guest_mem.write`), the child wakes with a header that disagrees with its own
+/// payload — a structurally dead agent session.
+///
+/// Same hand-marking virtio-block already does for read requests
+/// (`block/src/request.rs`, `.bitmap().mark_dirty(..)`); this closes the same
+/// gap on the vsock RX path.
+fn mark_guest_range_dirty<M: GuestMemory>(mem: &M, addr: GuestAddress, len: usize) {
+    if len == 0 {
+        return;
+    }
+    if let Ok(slice) = mem.get_slice(addr, len) {
+        slice.bitmap().mark_dirty(0, len);
+    }
 }
 
 impl VsockPacket {
@@ -319,38 +350,39 @@ impl VsockPacket {
                 return Err(VsockError::BufDescTooSmall);
             }
 
+            let buf_addr = buf_desc
+                .addr()
+                .translate_gva(access_platform, buf_size)
+                .map_err(|_| VsockError::GuestMemory)?;
+            // RX payload is written through the raw pointer below, which the
+            // dirty bitmap does not observe. Mark it here, before handing the
+            // pointer out.
+            mark_guest_range_dirty(desc_chain.memory(), buf_addr, buf_size);
             Ok(Self {
                 guest_hdr_addr,
                 hdr,
                 buf: Some(PacketBuffer::Borrowed {
-                    ptr: get_host_address_range(
-                        desc_chain.memory(),
-                        buf_desc
-                            .addr()
-                            .translate_gva(access_platform, buf_size)
-                            .map_err(|_| VsockError::GuestMemory)?,
-                        buf_size,
-                    )
-                    .ok_or(VsockError::GuestMemory)?,
+                    ptr: get_host_address_range(desc_chain.memory(), buf_addr, buf_size)
+                        .ok_or(VsockError::GuestMemory)?,
                     len: buf_size,
                 }),
             })
         } else {
             let buf_size: usize = head.len() as usize - VSOCK_PKT_HDR_SIZE;
+            let buf_addr = head
+                .addr()
+                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+                .ok_or(VsockError::GuestMemory)?
+                .translate_gva(access_platform, buf_size)
+                .map_err(|_| VsockError::GuestMemory)?;
+            // Same raw-pointer write as the branch above.
+            mark_guest_range_dirty(desc_chain.memory(), buf_addr, buf_size);
             Ok(Self {
                 guest_hdr_addr,
                 hdr,
                 buf: Some(PacketBuffer::Borrowed {
-                    ptr: get_host_address_range(
-                        desc_chain.memory(),
-                        head.addr()
-                            .checked_add(VSOCK_PKT_HDR_SIZE as u64)
-                            .ok_or(VsockError::GuestMemory)?
-                            .translate_gva(access_platform, buf_size)
-                            .map_err(|_| VsockError::GuestMemory)?,
-                        buf_size,
-                    )
-                    .ok_or(VsockError::GuestMemory)?,
+                    ptr: get_host_address_range(desc_chain.memory(), buf_addr, buf_size)
+                        .ok_or(VsockError::GuestMemory)?,
                     len: buf_size,
                 }),
             })
