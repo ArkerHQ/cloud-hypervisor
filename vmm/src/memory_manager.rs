@@ -3338,18 +3338,45 @@ static ARKER_PENDING_DELTA: std::sync::Mutex<Option<MemoryRangeTable>> =
 /// child whose memory is silently stale in exactly those pages.
 pub fn arker_publish_delta(table: MemoryRangeTable) {
     if let Ok(mut slot) = ARKER_PENDING_DELTA.lock() {
-        let merged = match slot.take() {
-            Some(prev) => {
-                let mut acc = prev;
-                for r in table.regions() {
-                    acc.push(r.clone());
-                }
-                acc
-            }
-            None => table,
-        };
-        *slot = Some(merged);
+        let mut all: Vec<MemoryRange> = Vec::new();
+        if let Some(prev) = slot.take() {
+            all.extend(prev.regions().iter().cloned());
+        }
+        all.extend(table.regions().iter().cloned());
+        *slot = Some(arker_coalesce(all));
     }
+}
+
+/// Sort and merge overlapping/adjacent ranges.
+///
+/// `MemoryRangeTable::push` is a plain `Vec::push` with no dedup, and this
+/// accumulator is appended to on EVERY snapshot and never cleared. Without
+/// coalescing the table grows without bound, carrying duplicates and overlaps,
+/// and `arker_dirty_overlaps` linear-scans all of it once per region -- so both
+/// the scan and the write loop degrade with each successive snapshot, turning
+/// what should be a bounded delta into an unbounded one. Merging also collapses
+/// adjacent extents into single large writes, which is what makes the write
+/// sequential rather than a storm of tiny seeks.
+fn arker_coalesce(mut v: Vec<MemoryRange>) -> MemoryRangeTable {
+    let mut out = MemoryRangeTable::default();
+    if v.is_empty() {
+        return out;
+    }
+    v.sort_by_key(|r| r.gpa);
+    let mut cur = v[0].clone();
+    for r in v.into_iter().skip(1) {
+        let cur_end = cur.gpa + cur.length;
+        if r.gpa <= cur_end {
+            // Overlapping or touching: extend rather than emit a second extent.
+            let end = cur_end.max(r.gpa + r.length);
+            cur.length = end - cur.gpa;
+        } else {
+            out.push(cur);
+            cur = r;
+        }
+    }
+    out.push(cur);
+    out
 }
 
 fn arker_delta_enabled() -> bool {
@@ -3470,8 +3497,29 @@ impl Transportable for MemoryManager {
             // would name different pages. Size equality is the cheap proxy for
             // "same regions in the same order", which is what holds while the VM's
             // memory topology is unchanged. Any mismatch => dense dump.
+            let dirty_bytes: u64 = arker_delta
+                .as_ref()
+                .map(|t| t.regions().iter().map(|r| r.length).sum())
+                .unwrap_or(0);
+            let dirty_extents = arker_delta.as_ref().map(|t| t.regions().len()).unwrap_or(0);
+            // Bail out to the dense dump when the delta stops being a win. Both
+            // bounds are about WALL CLOCK, not correctness: 8 GiB written
+            // sequentially is ~2.5s here, while a scattered set costs a seek per
+            // extent, so past some fragmentation the "optimisation" loses -- and
+            // if it overruns arkerd's snapshot timeout the VM is reaped mid-write
+            // and the fork fails outright, which is worse than being slow.
+            let too_dirty = dirty_bytes * 2 > total_len;
+            let too_scattered = dirty_extents > 200_000;
             let base_len = std::fs::metadata(base).map(|m| m.len()).unwrap_or(0);
-            if base_len != total_len {
+            if too_dirty || too_scattered {
+                arker_delta_report(&format!(
+                    "CHDELTA skip: dirty_MB={} extents={} (too_dirty={} too_scattered={}) — dense dump",
+                    dirty_bytes / 1048576,
+                    dirty_extents,
+                    too_dirty,
+                    too_scattered
+                ));
+            } else if base_len != total_len {
                 arker_delta_report(&format!(
                     "CHDELTA skip: base_len={base_len} total_len={total_len} (size mismatch) — dense dump"
                 ));
