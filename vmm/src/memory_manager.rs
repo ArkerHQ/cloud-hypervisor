@@ -3603,7 +3603,10 @@ impl Transportable for MemoryManager {
                 ));
             } else if base.is_file() {
                 match arker_ficlone(base, &memory_file_path) {
-                    Ok(()) => arker_delta_active = true,
+                    Ok(()) => {
+                        arker_delta_report("CHDELTA ficlone: ok, entering write loop");
+                        arker_delta_active = true;
+                    }
                     Err(e) => {
                         // Reflink failed (wrong fs, cross-device, ENOTSUP).
                         // Dense dump below is still correct.
