@@ -3700,7 +3700,7 @@ impl Transportable for MemoryManager {
                     // wedged look identical from outside once arkerd times the
                     // snapshot out and reaps the VM -- which kills the VMM before
                     // any end-of-run report can be written.
-                    if arker_extents % 20_000 == 0 {
+                    if arker_extents % 1_000 == 0 {
                         arker_delta_report(&format!(
                             "CHDELTA progress: extents={} written_MB={} elapsed_ms={:.0}",
                             arker_extents,
