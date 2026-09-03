@@ -134,7 +134,7 @@ pub struct VsockPacket {
 /// Same hand-marking virtio-block already does for read requests
 /// (`block/src/request.rs`, `.bitmap().mark_dirty(..)`); this closes the same
 /// gap on the vsock RX path.
-fn mark_guest_range_dirty<M: GuestMemory>(mem: &M, addr: GuestAddress, len: usize) {
+fn mark_guest_range_dirty<M: GuestMemory + ?Sized>(mem: &M, addr: GuestAddress, len: usize) {
     if len == 0 {
         return;
     }
