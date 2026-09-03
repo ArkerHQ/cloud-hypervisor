@@ -3452,8 +3452,14 @@ impl Transportable for MemoryManager {
         // nothing", "the base was rejected", and "the env never arrived".
         if arker_delta_enabled() {
             arker_delta_report(&format!(
-                "CHDELTA decide: published={} base={:?} total_len={}",
+                "CHDELTA decide: published={} dirty_ranges={} dirty_MB={} regions={} base={:?} total_len={}",
                 arker_delta.is_some(),
+                arker_delta.as_ref().map(|t| t.regions().len()).unwrap_or(0),
+                arker_delta
+                    .as_ref()
+                    .map(|t| t.regions().iter().map(|r| r.length).sum::<u64>() / 1048576)
+                    .unwrap_or(0),
+                self.snapshot_memory_ranges.regions().len(),
                 arker_base.as_ref().map(|p| p.display().to_string()),
                 total_len
             ));
@@ -3505,6 +3511,8 @@ impl Transportable for MemoryManager {
 
         let mut arker_written: u64 = 0;
         let mut arker_skipped: u64 = 0;
+        let arker_t0 = std::time::Instant::now();
+        let mut arker_extents: u64 = 0;
         for range in self.snapshot_memory_ranges.regions() {
             // Delta: the reflinked base already holds this range's bytes. Write
             // only the sub-extents the guest dirtied since the base was frozen,
@@ -3561,6 +3569,19 @@ impl Transportable for MemoryManager {
                         off += n as u64;
                     }
                     arker_written += dlen;
+                    arker_extents += 1;
+                    // Heartbeat. A delta that is merely SLOW and one that is
+                    // wedged look identical from outside once arkerd times the
+                    // snapshot out and reaps the VM -- which kills the VMM before
+                    // any end-of-run report can be written.
+                    if arker_extents % 20_000 == 0 {
+                        arker_delta_report(&format!(
+                            "CHDELTA progress: extents={} written_MB={} elapsed_ms={:.0}",
+                            arker_extents,
+                            arker_written / 1048576,
+                            arker_t0.elapsed().as_secs_f64() * 1000.0
+                        ));
+                    }
                 }
                 file_cursor += range.length;
                 continue;
@@ -3690,10 +3711,12 @@ impl Transportable for MemoryManager {
         }
         if arker_delta_active {
             arker_delta_report(&format!(
-                "CHDELTA send: wrote_MB={} skipped_MB={} total_MB={} base={}",
+                "CHDELTA send: wrote_MB={} skipped_MB={} total_MB={} extents={} elapsed_ms={:.0} base={}",
                 arker_written / 1048576,
                 arker_skipped / 1048576,
                 total_len / 1048576,
+                arker_extents,
+                arker_t0.elapsed().as_secs_f64() * 1000.0,
                 arker_base.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             ));
         }
