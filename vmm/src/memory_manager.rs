@@ -3563,6 +3563,77 @@ impl Transportable for MemoryManager {
             file_cursor += range.length;
         }
 
+        // Soundness oracle, ported from FC's FC_DIFF_VERIFY. Dense-dump the SAME
+        // paused state to <dst>.fullref and byte-compare: any differing page is
+        // one that diverged from the FICLONE base but was absent from our dirty
+        // set. Without this a wrong oracle is invisible -- the fork succeeds, the
+        // guest does not panic, and only a later `/run` in the child fails.
+        //
+        // The first-diff offsets are the diagnosis: a handful clustered in one
+        // range reads as a device/virtio ring miss; a large systematic spread
+        // reads as the base having a different range LAYOUT than this VM (same
+        // total size, different order), which the size guard above cannot catch.
+        if arker_delta_active && std::env::var("ARKER_CH_DELTA_VERIFY").as_deref() == Ok("1") {
+            let t_v = std::time::Instant::now();
+            let ref_path = memory_file_path.with_extension("fullref");
+            match OpenOptions::new()
+                .read(true).write(true).create(true).truncate(true).open(&ref_path)
+            {
+                Ok(mut rf) => {
+                    let mut cur: u64 = 0;
+                    let mut ok = true;
+                    for range in self.snapshot_memory_ranges.regions() {
+                        if rf.seek(SeekFrom::Start(cur)).is_err() { ok = false; break; }
+                        let mut off: u64 = 0;
+                        while off < range.length {
+                            match guest_memory.write_volatile_to(
+                                GuestAddress(range.gpa + off),
+                                &mut rf,
+                                (range.length - off) as usize,
+                            ) {
+                                Ok(n) if n > 0 => off += n as u64,
+                                _ => { ok = false; break; }
+                            }
+                        }
+                        if !ok { break; }
+                        cur += range.length;
+                    }
+                    if ok {
+                        const PAGE: usize = 4096;
+                        let mut a = vec![0u8; PAGE];
+                        let mut b = vec![0u8; PAGE];
+                        let mut compared: u64 = 0;
+                        let mut differ: u64 = 0;
+                        let mut first: Vec<u64> = Vec::new();
+                        let mut off: u64 = 0;
+                        while off + PAGE as u64 <= cur {
+                            // Sequenced, not chained: `x.seek(..).and_then(|_| read(&mut x))`
+                            // borrows x mutably twice.
+                            let ra = memory_file.seek(SeekFrom::Start(off)).is_ok()
+                                && std::io::Read::read_exact(&mut memory_file, &mut a).is_ok();
+                            let rb = rf.seek(SeekFrom::Start(off)).is_ok()
+                                && std::io::Read::read_exact(&mut rf, &mut b).is_ok();
+                            if ra && rb {
+                                compared += 1;
+                                if a != b {
+                                    differ += 1;
+                                    if first.len() < 16 { first.push(off); }
+                                }
+                            }
+                            off += PAGE as u64;
+                        }
+                        eprintln!(
+                            "CHDELTA_VERIFY: pages_compared={} pages_differ={} verify_ms={:.1} first_diffs={:?}",
+                            compared, differ, t_v.elapsed().as_secs_f64() * 1000.0, first
+                        );
+                    } else {
+                        eprintln!("CHDELTA_VERIFY: reference dump failed — no verdict");
+                    }
+                    let _ = std::fs::remove_file(&ref_path);
+                }
+                Err(e) => eprintln!("CHDELTA_VERIFY: could not open reference file: {e}"),
+            }
+        }
         if arker_delta_active {
             eprintln!(
                 "CHDELTA send: wrote_MB={} skipped_MB={} total_MB={} base={}",
