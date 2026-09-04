@@ -975,8 +975,29 @@ impl MemoryManager {
         if saved_regions.is_empty() {
             return Ok(());
         }
+        // OVERLAY IMAGES. A delta snapshot writes ONLY the pages that changed,
+        // leaving the rest as holes, because obtaining the unchanged bytes by
+        // reflink costs O(extents) on these images and does not return. The
+        // sidecar names the base those pages were diffed against: map the base
+        // here and lay the overlay's written extents over it afterwards.
+        //
+        // Refuse rather than guess when the base is gone. Mapping an overlay
+        // alone would restore holes as ZEROS -- a guest with mostly-blank RAM,
+        // which fails silently and looks like memory corruption rather than a
+        // missing file.
+        let (map_path, overlay_path) = match arker_overlay_base(file_path) {
+            Some(Ok(base)) => (base, Some(file_path.to_path_buf())),
+            Some(Err(missing)) => {
+                return Err(Error::SnapshotOpen(std::io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("overlay image {} needs base {missing}, which is absent",
+                            file_path.display()),
+                )));
+            }
+            None => (file_path.to_path_buf(), None),
+        };
         let guest_memory = self.guest_memory.memory();
-        let file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+        let file = File::open(&map_path).map_err(Error::SnapshotOpen)?;
         let fd = file.as_raw_fd();
 
         let mut segs: Vec<(u64, u64)> = Vec::new();
@@ -1049,6 +1070,69 @@ impl MemoryManager {
             }
         });
         drop(file);
+
+        // ── lay the OVERLAY over the mapped base ───────────────────────────
+        // Only the extents the delta actually wrote are read back. They are
+        // found with SEEK_DATA/SEEK_HOLE rather than by trusting a length,
+        // because the file is deliberately sparse and its holes mean "unchanged,
+        // take the base" -- reading them as zeros is exactly the silent
+        // corruption this design has to avoid.
+        //
+        // Writes land on MAP_PRIVATE pages, so they copy-on-write into this
+        // guest's own memory and never touch the shared base.
+        if let Some(ov) = overlay_path {
+            let t0 = std::time::Instant::now();
+            let ovf = File::open(&ov).map_err(Error::SnapshotOpen)?;
+            let ovfd = ovf.as_raw_fd();
+            let end = ovf.metadata().map_err(Error::SnapshotOpen)?.len();
+            let mut applied: u64 = 0;
+            let mut off: u64 = 0;
+            while off < end {
+                // SAFETY: FFI lseek on an owned fd; both whences are valid.
+                let data = unsafe { libc::lseek(ovfd, off as i64, libc::SEEK_DATA) };
+                if data < 0 {
+                    break; // ENXIO: no more data extents
+                }
+                // SAFETY: as above.
+                let hole = unsafe { libc::lseek(ovfd, data, libc::SEEK_HOLE) };
+                if hole < 0 {
+                    break;
+                }
+                let (d, h) = (data as u64, hole as u64);
+                // Map the dense file offset back to a GPA through the same range
+                // table the writer used, so an overlay can only be applied to the
+                // layout it was produced against.
+                let mut cur: u64 = 0;
+                for range in saved_regions.regions() {
+                    let r_start = cur;
+                    let r_end = cur + range.length;
+                    cur = r_end;
+                    let s = d.max(r_start);
+                    let e = h.min(r_end);
+                    if s >= e {
+                        continue;
+                    }
+                    let gpa = range.gpa + (s - r_start);
+                    let len = (e - s) as usize;
+                    let mut buf = vec![0u8; len];
+                    use std::os::unix::fs::FileExt as _;
+                    ovf.read_exact_at(&mut buf, s).map_err(Error::SnapshotRead)?;
+                    guest_memory
+                        .write_slice(&buf, GuestAddress(gpa))
+                        .map_err(|_| {
+                            Error::SnapshotRead(io::Error::other("overlay write_slice failed"))
+                        })?;
+                    applied += len as u64;
+                }
+                off = h;
+            }
+            info!(
+                "CHDELTA overlay applied: {} MiB in {:.0}ms over base",
+                applied / 1048576,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
         Ok(())
     }
 
@@ -3517,6 +3601,31 @@ const ARKER_MAX_BASE_EXTENTS: u32 = 4_096;
 /// ONCE as a dense dump and every diff reflinks THAT. This restores the same
 /// invariant: the base is always an unfragmented image.
 const ARKER_DENSE_MARK: &str = "#arker-dense\n";
+/// If `image` is a sparse OVERLAY, return the base it must be layered over.
+///
+/// `None`  — a normal, self-contained image.
+/// `Some(Ok(base))`   — overlay whose base exists.
+/// `Some(Err(path))`  — overlay whose base is MISSING; the caller must fail
+///                      loudly, because mapping the overlay alone restores its
+///                      holes as zeros and hands the guest blank RAM.
+fn arker_overlay_base(image: &Path) -> Option<std::result::Result<PathBuf, String>> {
+    let sidecar = std::fs::read_to_string(arker_layout_path(image)).ok()?;
+    let rest = sidecar.strip_prefix(ARKER_OVERLAY_MARK)?;
+    let base = rest.lines().next().unwrap_or("").trim();
+    if base.is_empty() {
+        return Some(Err(String::from("<unnamed>")));
+    }
+    let p = PathBuf::from(base);
+    if p.is_file() {
+        Some(Ok(p))
+    } else {
+        Some(Err(base.to_string()))
+    }
+}
+
+/// Marks a SPARSE OVERLAY: only pages changed since the base named on the next
+/// line. Meaningless alone -- restore must map that base underneath it.
+const ARKER_OVERLAY_MARK: &str = "#arker-overlay\n";
 
 fn arker_layout_path(image: &Path) -> PathBuf {
     let mut p = image.to_path_buf();
@@ -3736,20 +3845,19 @@ impl Transportable for MemoryManager {
                     "CHDELTA skip: base_len={base_len} total_len={total_len} (size mismatch) — dense dump"
                 ));
             } else if base.is_file() {
-                match arker_ficlone(base, &memory_file_path) {
-                    Ok(()) => {
-                        arker_delta_report("CHDELTA ficlone: ok, entering write loop");
-                        arker_delta_active = true;
-                    }
-                    Err(e) => {
-                        // Reflink failed (wrong fs, cross-device, ENOTSUP).
-                        // Dense dump below is still correct.
-                        let _ = std::fs::remove_file(&memory_file_path);
-                        arker_delta_report(&format!(
-                            "CHDELTA skip: ficlone failed ({e}) — dense dump"
-                        ));
-                    }
-                }
+                // OVERLAY, not reflink. FICLONE duplicates the SOURCE's extent tree,
+                // so it costs O(extents) -- and these images carry on the order of
+                // 10^6 extents (8 GiB written range-by-range into a sparse file).
+                // That is why the reflink never returned, and why a FIEMAP count of
+                // the same file hung in exactly the same way.
+                //
+                // So stop trying to obtain the unchanged 7.9 GiB at all. Leave the
+                // destination SPARSE, write only the dirty pages at their dense
+                // offsets, and let restore mmap the base and lay this over it. The
+                // unchanged bytes are never copied and the extent allocator never
+                // sees them, which is what makes this O(dirty) instead of O(image).
+                arker_delta_active = true;
+                arker_delta_report("CHDELTA overlay: sparse diff; base mapped at restore");
             }
         }
         let mut memory_file = OpenOptions::new()
@@ -3989,15 +4097,30 @@ impl Transportable for MemoryManager {
         if arker_delta_active {
             arker_close_deferred(memory_file);
         }
-        // Record the layout beside the image for the next delta to verify.
-        let _ = std::fs::write(
-            arker_layout_path(&memory_file_path),
+        // The sidecar tells restore what this image IS. A dense image is
+        // self-contained; an OVERLAY carries only changed pages and is
+        // meaningless without the base it was diffed against, so name that base.
+        // Restoring an overlay as though it were dense yields mostly-holes --
+        // zeroed guest RAM, silently -- so restore must refuse when the base is
+        // missing rather than guess.
+        let sidecar = if arker_delta_active {
+            format!(
+                "{}{}{}",
+                ARKER_OVERLAY_MARK,
+                arker_base
+                    .as_ref()
+                    .map(|p| format!("{}\n", p.display()))
+                    .unwrap_or_default(),
+                arker_layout_string(&self.snapshot_memory_ranges)
+            )
+        } else {
             format!(
                 "{}{}",
-                if arker_delta_active { "" } else { ARKER_DENSE_MARK },
+                ARKER_DENSE_MARK,
                 arker_layout_string(&self.snapshot_memory_ranges)
-            ),
-        );
+            )
+        };
+        let _ = std::fs::write(arker_layout_path(&memory_file_path), sidecar);
         debug_assert_eq!(file_cursor, total_len);
         // ARKER: the empty-snapshot bug was invisible for a long time because
         // nothing reported how many bytes a snapshot actually captured. Say so.
