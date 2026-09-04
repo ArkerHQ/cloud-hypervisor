@@ -4105,6 +4105,50 @@ impl Transportable for MemoryManager {
                     }
                     if ok {
                         const PAGE: usize = 4096;
+                        // OVERLAY-AWARE, and it has to be. `memory_file` is the
+                        // image we just wrote; under the delta that is a SPARSE
+                        // overlay whose holes mean "unchanged, take the base". A
+                        // naive compare against the dense reference reads every
+                        // hole as zeros and counts each non-zero unchanged page as
+                        // a difference: measured pages_differ=17306 of 131072 on a
+                        // healthy 512 MiB fork, which is the sparse design working,
+                        // not corruption. This oracle exists to catch a WRONG dirty
+                        // set, so a 13% false positive would make it worse than
+                        // useless -- it would be read as data loss.
+                        //
+                        // Reconstruct what a restore actually sees: overlay where
+                        // the overlay has data, base everywhere else. Extents come
+                        // from `next_data_extent`, the same walk the writer and
+                        // `arker_apply_overlay` use.
+                        // `arker_base`, NOT `arker_overlay_base(path)`: the latter
+                        // reads the sidecar, and the sidecar is written ~150 lines
+                        // BELOW this block. At verify time it does not exist yet, so
+                        // asking for it returned None and this whole reconstruction
+                        // silently did nothing -- the verdict was unchanged at
+                        // pages_differ=17306/17581, which is what exposed it.
+                        let mut base_file = arker_base.as_ref().and_then(|b| File::open(b).ok());
+                        let overlay_extents: Vec<(u64, u64)> = if base_file.is_some() {
+                            let mut v = Vec::new();
+                            let mut o: u64 = 0;
+                            while let Ok(Some((d, l))) =
+                                next_data_extent(memory_file.as_fd(), o, cur)
+                            {
+                                v.push((d, l));
+                                o = d + l;
+                            }
+                            v
+                        } else {
+                            Vec::new()
+                        };
+                        let page_is_overlay = |off: u64| -> bool {
+                            overlay_extents
+                                .iter()
+                                .any(|(d, l)| off >= *d && off < d + l)
+                        };
+                        // Self-describing: a verdict that cannot say whether it
+                        // reconstructed base+overlay or compared the raw sparse
+                        // file is unreadable — the two disagree by ~13%.
+                        let base_used = base_file.is_some();
                         let mut a = vec![0u8; PAGE];
                         let mut b = vec![0u8; PAGE];
                         let mut compared: u64 = 0;
@@ -4114,8 +4158,16 @@ impl Transportable for MemoryManager {
                         while off + PAGE as u64 <= cur {
                             // Sequenced, not chained: `x.seek(..).and_then(|_| read(&mut x))`
                             // borrows x mutably twice.
-                            let ra = memory_file.seek(SeekFrom::Start(off)).is_ok()
-                                && std::io::Read::read_exact(&mut memory_file, &mut a).is_ok();
+                            // Read the page a RESTORE would see: the overlay
+                            // where it wrote, the base underneath otherwise.
+                            let ra = if base_file.is_some() && !page_is_overlay(off) {
+                                let bf = base_file.as_mut().unwrap();
+                                bf.seek(SeekFrom::Start(off)).is_ok()
+                                    && std::io::Read::read_exact(bf, &mut a).is_ok()
+                            } else {
+                                memory_file.seek(SeekFrom::Start(off)).is_ok()
+                                    && std::io::Read::read_exact(&mut memory_file, &mut a).is_ok()
+                            };
                             let rb = rf.seek(SeekFrom::Start(off)).is_ok()
                                 && std::io::Read::read_exact(&mut rf, &mut b).is_ok();
                             if ra && rb {
@@ -4128,8 +4180,14 @@ impl Transportable for MemoryManager {
                             off += PAGE as u64;
                         }
                         arker_delta_report(&format!(
-                            "CHDELTA_VERIFY: pages_compared={} pages_differ={} verify_ms={:.1} first_diffs={:?}",
-                            compared, differ, t_v.elapsed().as_secs_f64() * 1000.0, first
+                            "CHDELTA_VERIFY: pages_compared={} pages_differ={} base_used={} \
+                             overlay_extents={} verify_ms={:.1} first_diffs={:?}",
+                            compared,
+                            differ,
+                            base_used,
+                            overlay_extents.len(),
+                            t_v.elapsed().as_secs_f64() * 1000.0,
+                            first
                         ));
                     } else {
                         eprintln!("CHDELTA_VERIFY: reference dump failed — no verdict");
