@@ -3452,6 +3452,56 @@ fn arker_layout_string(table: &MemoryRangeTable) -> String {
     out
 }
 
+/// Count a file's extents via FIEMAP with `fm_extent_count = 0`.
+///
+/// FICLONE duplicates the SOURCE's extent tree, so its cost is O(extents), not
+/// O(1). A pristine 8 GiB image is a handful of extents and reflinks instantly; a
+/// previous DELTA output is a reflink carrying thousands of scattered patches,
+/// and reflinking THAT blocks long enough for arkerd to time the snapshot out and
+/// reap the VM -- measured as 'CHDELTA decide' logged with 'ficlone ok' never
+/// reached, no panic, no signal, no coredump.
+///
+/// Asking FIEMAP for zero extents makes the kernel fill in `fm_mapped_extents`
+/// only, so this is one cheap ioctl rather than a full extent walk. Measuring the
+/// real property beats inferring it from provenance: goldens carry no sidecar of
+/// ours, so a provenance test would refuse every base forever and the delta would
+/// never engage at all.
+#[repr(C)]
+#[derive(Default)]
+struct ArkerFiemap {
+    fm_start: u64,
+    fm_length: u64,
+    fm_flags: u32,
+    fm_mapped_extents: u32,
+    fm_extent_count: u32,
+    fm_reserved: u32,
+}
+
+fn arker_extent_count(path: &Path) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    const FS_IOC_FIEMAP: u64 = 0xc020_660b;
+    let f = File::open(path).ok()?;
+    let mut fm = ArkerFiemap {
+        fm_start: 0,
+        fm_length: u64::MAX,
+        fm_extent_count: 0,
+        ..Default::default()
+    };
+    // SAFETY: `fm` is a correctly-shaped fiemap header owned here; with
+    // fm_extent_count = 0 the kernel writes only fm_mapped_extents and never
+    // touches the (absent) trailing extent array.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FIEMAP as _, &mut fm as *mut _) };
+    if rc != 0 {
+        return None;
+    }
+    Some(fm.fm_mapped_extents)
+}
+
+/// Above this the reflink costs more than the dense write it is meant to avoid.
+/// A clean image is single-digit extents; the delta outputs that hung were
+/// thousands.
+const ARKER_MAX_BASE_EXTENTS: u32 = 4_096;
+
 /// Marker line recording HOW an image was written.
 ///
 /// Only a DENSE image may serve as a delta base, and this is the whole reason:
@@ -3644,20 +3694,21 @@ impl Transportable for MemoryManager {
                 // assume.
                 let want = arker_layout_string(&self.snapshot_memory_ranges);
                 let got = std::fs::read_to_string(arker_layout_path(base)).unwrap_or_default();
-                let dense_base = got.starts_with(ARKER_DENSE_MARK);
-                let layout_ok = got.strip_prefix(ARKER_DENSE_MARK).unwrap_or(&got) == want;
-                let refuse = !dense_base || !layout_ok;
+                // A base with no sidecar is accepted on LAYOUT (goldens predate
+                // this and would otherwise be refused for ever), but never on
+                // fragmentation -- that is measured directly.
+                let layout_ok = got.is_empty()
+                    || got.strip_prefix(ARKER_DENSE_MARK).unwrap_or(&got) == want;
+                let extents = arker_extent_count(base);
+                let too_fragmented = extents.is_some_and(|n| n > ARKER_MAX_BASE_EXTENTS);
+                let refuse = !layout_ok || too_fragmented;
                 if refuse {
                     arker_delta_report(&format!(
-                        "CHDELTA skip: base {} — dense dump",
-                        if got.is_empty() {
-                            "layout absent"
-                        } else if !dense_base {
-                            "is itself a delta (fragmented; FICLONE would be O(extents))"
-                        } else {
-                            "layout differs"
-                        }
+                        "CHDELTA skip: base extents={:?} layout_ok={} — dense dump",
+                        extents, layout_ok
                     ));
+                } else {
+                    arker_delta_report(&format!("CHDELTA base: extents={extents:?} ok"));
                 }
                 refuse
             } {
