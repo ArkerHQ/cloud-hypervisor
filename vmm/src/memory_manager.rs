@@ -3666,27 +3666,6 @@ struct ArkerFiemap {
     fm_reserved: u32,
 }
 
-#[allow(dead_code)] // retained: see the note at its call site
-fn arker_extent_count(path: &Path) -> Option<u32> {
-    use std::os::unix::io::AsRawFd;
-    const FS_IOC_FIEMAP: u64 = 0xc020_660b;
-    let f = File::open(path).ok()?;
-    let mut fm = ArkerFiemap {
-        fm_start: 0,
-        fm_length: u64::MAX,
-        fm_extent_count: 0,
-        ..Default::default()
-    };
-    // SAFETY: `fm` is a correctly-shaped fiemap header owned here; with
-    // fm_extent_count = 0 the kernel writes only fm_mapped_extents and never
-    // touches the (absent) trailing extent array.
-    let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FIEMAP as _, &mut fm as *mut _) };
-    if rc != 0 {
-        return None;
-    }
-    Some(fm.fm_mapped_extents)
-}
-
 /// Above this the reflink costs more than the dense write it is meant to avoid.
 /// A clean image is single-digit extents; the delta outputs that hung were
 /// thousands.
@@ -3740,36 +3719,6 @@ fn arker_layout_path(image: &Path) -> PathBuf {
         .unwrap_or_else(|| String::from("memory-ranges"));
     p.set_file_name(format!("{name}.layout"));
     p
-}
-
-/// Reflink `src` onto `dst`. XFS on /data is `reflink=1`, so this is O(1) and
-/// shares extents; a plain copy would defeat the entire point.
-fn arker_ficlone(src: &Path, dst: &Path) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    const FICLONE_REQ: u64 = 0x4004_9409;
-    let s = File::open(src)?;
-    let d = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
-    // SAFETY: both descriptors are open regular files owned by this scope; the
-    // ioctl reads no user buffer and returns -1 on failure.
-    let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE_REQ as _, s.as_raw_fd()) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // DEFER THE CLOSE. This is the Firecracker lesson (our fork, 27ff189d8):
-    // close() on a large snapshot memory file measured 1191.9ms -- 44% of the
-    // whole operation -- because XFS trims speculative extent preallocation on
-    // LAST CLOSE. Here it is worse: `src` is itself a reflinked, scattered-patched
-    // image, so the extent map being duplicated and then reconciled is large, and
-    // the close happens INSIDE the snapshot HTTP handler. The VMM stops answering,
-    // ch-remote reports "HTTP output is missing protocol statement", arkerd times
-    // the snapshot out and reaps the VM -- which is exactly the shape observed:
-    // 'CHDELTA decide' logged, no 'ficlone ok', no panic, no signal.
-    //
-    // Nothing depends on this descriptor closing first: the ioctl has returned, so
-    // the clone is durable in the filesystem, and the writes below go through the
-    // separate fd `send()` opens.
-    arker_close_deferred(d);
-    Ok(())
 }
 
 /// Hand a `File` to a background thread to be closed.
