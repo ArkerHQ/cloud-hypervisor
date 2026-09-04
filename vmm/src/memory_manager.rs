@@ -3464,8 +3464,24 @@ fn arker_coalesce(mut v: Vec<MemoryRange>) -> MemoryRangeTable {
     out
 }
 
+/// Delta snapshots: ON unless explicitly disabled.
+///
+/// Measured on an 8 GiB Windows guest, both workers: capture writes 156 MB in
+/// 69ms instead of 8192 MB in ~2500ms, and `snapshot_for_fork` drops from
+/// ~2500ms to 359-419ms. End to end every fork is sub-second -- first capture
+/// 0.41s, capture after a 200 MB write 0.47s, reuse 0.04s.
+///
+/// Correctness gate before flipping the default: the full Windows suite ran
+/// 49/49 with this on (uncovered=0 vs baseline), including
+/// test_a_fork_of_a_used_vm_can_run / _can_sync, which prove a child restored
+/// from base+overlay actually runs and syncs.
+///
+/// `ARKER_CH_DELTA=0` is the escape hatch, and every guard still falls back to
+/// a dense dump on its own: layout mismatch, missing base, too-dirty and
+/// too-scattered. A dense image remains self-contained, so turning this off
+/// costs latency and nothing else.
 fn arker_delta_enabled() -> bool {
-    matches!(std::env::var("ARKER_CH_DELTA").ok().as_deref(), Some("1"))
+    !matches!(std::env::var("ARKER_CH_DELTA").ok().as_deref(), Some("0"))
 }
 
 /// Report a delta line to BOTH stderr and a fixed path.
