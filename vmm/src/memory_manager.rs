@@ -3480,7 +3480,7 @@ fn arker_coalesce(mut v: Vec<MemoryRange>) -> MemoryRangeTable {
 /// a dense dump on its own: layout mismatch, missing base, too-dirty and
 /// too-scattered. A dense image remains self-contained, so turning this off
 /// costs latency and nothing else.
-fn arker_delta_enabled() -> bool {
+pub(crate) fn arker_delta_enabled() -> bool {
     !matches!(std::env::var("ARKER_CH_DELTA").ok().as_deref(), Some("0"))
 }
 
@@ -3520,7 +3520,7 @@ fn arker_install_panic_hook() {
     });
 }
 
-fn arker_delta_report(line: &str) {
+pub(crate) fn arker_delta_report(line: &str) {
     eprintln!("{line}");
     use std::io::Write as _;
     if let Ok(mut f) = OpenOptions::new()

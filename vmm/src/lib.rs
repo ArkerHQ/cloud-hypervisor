@@ -1913,14 +1913,18 @@ impl RequestHandler for Vmm {
             // identical flags is a no-op), so this only protects the VMM half.
             static ARKER_DIRTY_ARMED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1")
+            if crate::memory_manager::arker_delta_enabled()
                 && !ARKER_DIRTY_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
                 match vm.start_dirty_log() {
-                    Ok(()) => eprintln!("CHDIRTY start_dirty_log OK (armed once)"),
+                    Ok(()) => crate::memory_manager::arker_delta_report(
+                        "CHDIRTY start_dirty_log OK (armed once)",
+                    ),
                     Err(e) => {
                         ARKER_DIRTY_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
-                        eprintln!("CHDIRTY start_dirty_log FAILED: {:?}", e);
+                        crate::memory_manager::arker_delta_report(&format!(
+                            "CHDIRTY start_dirty_log FAILED: {e:?}"
+                        ));
                     }
                 }
             }
@@ -1942,7 +1946,14 @@ impl RequestHandler for Vmm {
             //
             // Read here, with the vCPUs already paused by the snapshot path, so the
             // set cannot grow between reading it and writing the memory file.
-            let want_delta = std::env::var("ARKER_CH_DELTA").as_deref() == Ok("1");
+            // SINGLE source of truth, shared with `send()`. This used to test
+            // `== Ok("1")` independently, so flipping the default to ON in
+            // `arker_delta_enabled()` and dropping ARKER_CH_DELTA from config.env
+            // left THIS gate false: nothing was ever published, `send()` found no
+            // pending delta, and every capture silently took the dense 8 GiB path
+            // (measured: 2272ms/3131ms vs 359ms when the delta fires). Two gates
+            // for one decision is how that divergence happened; there is now one.
+            let want_delta = crate::memory_manager::arker_delta_enabled();
             let want_probe = std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1");
             if want_delta || want_probe {
                 match vm.dirty_log() {
@@ -1950,11 +1961,11 @@ impl RequestHandler for Vmm {
                         if want_probe {
                             let pages: u64 =
                                 table.regions().iter().map(|r| r.length).sum::<u64>() / 4096;
-                            eprintln!(
+                            crate::memory_manager::arker_delta_report(&format!(
                                 "CHDIRTY dirty_log OK total_dirty_pages={} total_MB={}",
                                 pages,
                                 pages * 4096 / 1048576
-                            );
+                            ));
                         }
                         if want_delta {
                             crate::memory_manager::arker_publish_delta(table);
@@ -1962,7 +1973,9 @@ impl RequestHandler for Vmm {
                     }
                     // No dirty set means no delta: `send` finds nothing published
                     // and takes the dense path, which is always correct.
-                    Err(e) => eprintln!("CHDIRTY dirty_log FAILED: {:?}", e),
+                    Err(e) => crate::memory_manager::arker_delta_report(&format!(
+                        "CHDIRTY dirty_log FAILED: {e:?}"
+                    )),
                 }
             }
             // NO re-arm here, deliberately. `ARKER_CH_SNAP_BASE` is fixed for the
