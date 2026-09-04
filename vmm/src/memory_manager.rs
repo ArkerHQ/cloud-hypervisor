@@ -4179,6 +4179,38 @@ impl Transportable for MemoryManager {
                             }
                             off += PAGE as u64;
                         }
+                        // When only a handful of pages differ, the BYTES identify
+                        // what was missed far faster than any amount of reasoning:
+                        // a vring shows as small ascending indices, a page table as
+                        // aligned addresses, real guest data as neither. Bounded to
+                        // one page so a large divergence never floods the log.
+                        if differ > 0 && differ <= 4 {
+                            if let Some(&off0) = first.first() {
+                                let mut pa = vec![0u8; 64];
+                                let mut pb = vec![0u8; 64];
+                                let ga = if base_used && !page_is_overlay(off0) {
+                                    base_file.as_mut().map(|bf| {
+                                        bf.seek(SeekFrom::Start(off0)).is_ok()
+                                            && std::io::Read::read_exact(bf, &mut pa).is_ok()
+                                    }) == Some(true)
+                                } else {
+                                    memory_file.seek(SeekFrom::Start(off0)).is_ok()
+                                        && std::io::Read::read_exact(&mut memory_file, &mut pa)
+                                            .is_ok()
+                                };
+                                let gb = rf.seek(SeekFrom::Start(off0)).is_ok()
+                                    && std::io::Read::read_exact(&mut rf, &mut pb).is_ok();
+                                if ga && gb {
+                                    arker_delta_report(&format!(
+                                        "CHDELTA_VERIFY page {off0}: from_overlay={} \
+                                         restored={:02x?} reference={:02x?}",
+                                        page_is_overlay(off0),
+                                        &pa[..64],
+                                        &pb[..64]
+                                    ));
+                                }
+                            }
+                        }
                         arker_delta_report(&format!(
                             "CHDELTA_VERIFY: pages_compared={} pages_differ={} base_used={} \
                              overlay_extents={} verify_ms={:.1} first_diffs={:?}",
