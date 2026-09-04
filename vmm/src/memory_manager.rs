@@ -3452,6 +3452,21 @@ fn arker_layout_string(table: &MemoryRangeTable) -> String {
     out
 }
 
+/// Marker line recording HOW an image was written.
+///
+/// Only a DENSE image may serve as a delta base, and this is the whole reason:
+/// a delta output is a reflink with thousands of scattered patches, so its
+/// extent map is large -- and FICLONE duplicates the source's extent tree, which
+/// makes reflinking it O(extents). Chaining delta-onto-delta compounds that every
+/// generation until the ioctl itself stalls inside the snapshot HTTP handler.
+/// Measured: 'CHDELTA decide' logged and 'ficlone ok' never reached, with no
+/// panic, no signal and no coredump -- a process blocked in FICLONE.
+///
+/// Firecracker does not hit this because `dump_frozen_base` publishes mem.base
+/// ONCE as a dense dump and every diff reflinks THAT. This restores the same
+/// invariant: the base is always an unfragmented image.
+const ARKER_DENSE_MARK: &str = "#arker-dense\n";
+
 fn arker_layout_path(image: &Path) -> PathBuf {
     let mut p = image.to_path_buf();
     let name = p
@@ -3629,14 +3644,22 @@ impl Transportable for MemoryManager {
                 // assume.
                 let want = arker_layout_string(&self.snapshot_memory_ranges);
                 let got = std::fs::read_to_string(arker_layout_path(base)).unwrap_or_default();
-                let mismatch = got != want;
-                if mismatch {
+                let dense_base = got.starts_with(ARKER_DENSE_MARK);
+                let layout_ok = got.strip_prefix(ARKER_DENSE_MARK).unwrap_or(&got) == want;
+                let refuse = !dense_base || !layout_ok;
+                if refuse {
                     arker_delta_report(&format!(
-                        "CHDELTA skip: base layout {} — dense dump",
-                        if got.is_empty() { "absent" } else { "differs" }
+                        "CHDELTA skip: base {} — dense dump",
+                        if got.is_empty() {
+                            "layout absent"
+                        } else if !dense_base {
+                            "is itself a delta (fragmented; FICLONE would be O(extents))"
+                        } else {
+                            "layout differs"
+                        }
                     ));
                 }
-                mismatch
+                refuse
             } {
                 // reported above
             } else if base_len != total_len {
@@ -3900,7 +3923,11 @@ impl Transportable for MemoryManager {
         // Record the layout beside the image for the next delta to verify.
         let _ = std::fs::write(
             arker_layout_path(&memory_file_path),
-            arker_layout_string(&self.snapshot_memory_ranges),
+            format!(
+                "{}{}",
+                if arker_delta_active { "" } else { ARKER_DENSE_MARK },
+                arker_layout_string(&self.snapshot_memory_ranges)
+            ),
         );
         debug_assert_eq!(file_cursor, total_len);
         // ARKER: the empty-snapshot bug was invisible for a long time because
