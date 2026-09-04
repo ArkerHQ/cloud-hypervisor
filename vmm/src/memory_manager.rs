@@ -2036,7 +2036,7 @@ impl MemoryManager {
                     &mem_snapshot.memory_ranges,
                     exit_evt,
                 )?;
-            } else if std::env::var("ARKER_CH_COW").as_deref() == Ok("1") {
+            } else if arker_cow_enabled() {
                 mm.lock()
                     .unwrap()
                     .restore_by_cow_mmap(&memory_file_path, &mem_snapshot.memory_ranges)?;
@@ -3385,7 +3385,22 @@ impl Snapshottable for MemoryManager {
 /// byte of parent state. Under COW the ONLY authoritative source is the guest
 /// VA, so force the dense `write_volatile_to` path that reads it.
 fn arker_cow_enabled() -> bool {
-    std::env::var("ARKER_CH_COW").as_deref() == Ok("1")
+    cow_enabled(std::env::var("ARKER_CH_COW").ok().as_deref())
+}
+
+/// `ARKER_CH_COW` — opt-in, so ONLY "1" enables (the inverse default to
+/// `delta_enabled`, because a COW restore is the exception, not the rule).
+///
+/// One reader, deliberately. This variable was read inline at the restore site
+/// AND through `arker_cow_enabled()`; two gates for one decision is precisely how
+/// `ARKER_CH_DELTA` came to be true in `send()` and false in `vm_snapshot`, which
+/// silently took every capture down the dense 8 GiB path.
+///
+/// Pure, taking the value rather than reading the environment, so it is
+/// unit-testable — the shape `fc/snapshot.rs` uses for `fastpath_bitmap_enabled`
+/// and `uffd_ficlone_enabled`.
+fn cow_enabled(env: Option<&str>) -> bool {
+    env == Some("1")
 }
 
 /// Write a single guest RAM region to the snapshot file at `dst_offset`,
@@ -3547,7 +3562,14 @@ fn arker_coalesce(mut v: Vec<MemoryRange>) -> MemoryRangeTable {
 /// too-scattered. A dense image remains self-contained, so turning this off
 /// costs latency and nothing else.
 pub(crate) fn arker_delta_enabled() -> bool {
-    !matches!(std::env::var("ARKER_CH_DELTA").ok().as_deref(), Some("0"))
+    delta_enabled(std::env::var("ARKER_CH_DELTA").ok().as_deref())
+}
+
+/// `ARKER_CH_DELTA` — only an explicit "0" disables; absent or anything else is
+/// on, so a stale `ARKER_CH_DELTA=1` in a config keeps working unchanged. Same
+/// pure-predicate shape as `cow_enabled`.
+fn delta_enabled(env: Option<&str>) -> bool {
+    env != Some("0")
 }
 
 /// Report a delta line to BOTH stderr and a fixed path.
@@ -4294,7 +4316,29 @@ mod unit_tests {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
     use std::os::unix::fs::FileExt;
 
-    use super::{next_data_extent, write_region_sparse};
+    use super::{cow_enabled, delta_enabled, next_data_extent, write_region_sparse};
+
+    // The two flags default in OPPOSITE directions, which is the whole reason
+    // they are separate predicates and worth pinning: delta is on unless
+    // explicitly disabled, COW is off unless explicitly enabled. Reading either
+    // one inline a second time is how they silently diverge.
+    #[test]
+    fn delta_is_on_unless_explicitly_zero() {
+        assert!(delta_enabled(None));
+        assert!(delta_enabled(Some("1")));
+        assert!(delta_enabled(Some("")));
+        assert!(delta_enabled(Some("yes")));
+        assert!(!delta_enabled(Some("0")));
+    }
+
+    #[test]
+    fn cow_is_off_unless_explicitly_one() {
+        assert!(!cow_enabled(None));
+        assert!(!cow_enabled(Some("")));
+        assert!(!cow_enabled(Some("0")));
+        assert!(!cow_enabled(Some("true")));
+        assert!(cow_enabled(Some("1")));
+    }
 
     fn make_memfd(size: u64) -> std::fs::File {
         // SAFETY: memfd_create is a self-contained syscall; we own the
