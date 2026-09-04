@@ -3699,7 +3699,18 @@ impl Transportable for MemoryManager {
                 // fragmentation -- that is measured directly.
                 let layout_ok = got.is_empty()
                     || got.strip_prefix(ARKER_DENSE_MARK).unwrap_or(&got) == want;
+                // Bracket the FIEMAP call. The previous run logged 'decide' and
+                // then neither of this branch's two exhaustive reports, so the
+                // stall is between them -- these two lines say whether it is the
+                // ioctl (or the open) rather than anything after it.
+                arker_delta_report("CHDELTA probe: counting base extents");
+                let t_ext = std::time::Instant::now();
                 let extents = arker_extent_count(base);
+                arker_delta_report(&format!(
+                    "CHDELTA probe: extents={:?} in {:.0}ms",
+                    extents,
+                    t_ext.elapsed().as_secs_f64() * 1000.0
+                ));
                 let too_fragmented = extents.is_some_and(|n| n > ARKER_MAX_BASE_EXTENTS);
                 let refuse = !layout_ok || too_fragmented;
                 if refuse {
