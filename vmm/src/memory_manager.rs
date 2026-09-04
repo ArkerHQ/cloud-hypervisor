@@ -1126,11 +1126,12 @@ impl MemoryManager {
                 }
                 off = h;
             }
-            info!(
-                "CHDELTA overlay applied: {} MiB in {:.0}ms over base",
+            arker_delta_report(&format!(
+                "CHDELTA overlay applied: {} MiB in {:.0}ms over base {}",
                 applied / 1048576,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
+                t0.elapsed().as_secs_f64() * 1000.0,
+                map_path.display()
+            ));
         }
 
         Ok(())
