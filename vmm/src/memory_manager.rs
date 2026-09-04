@@ -1081,59 +1081,87 @@ impl MemoryManager {
         // Writes land on MAP_PRIVATE pages, so they copy-on-write into this
         // guest's own memory and never touch the shared base.
         if let Some(ov) = overlay_path {
-            let t0 = std::time::Instant::now();
-            let ovf = File::open(&ov).map_err(Error::SnapshotOpen)?;
-            let ovfd = ovf.as_raw_fd();
-            let end = ovf.metadata().map_err(Error::SnapshotOpen)?.len();
-            let mut applied: u64 = 0;
-            let mut off: u64 = 0;
-            while off < end {
-                // SAFETY: FFI lseek on an owned fd; both whences are valid.
-                let data = unsafe { libc::lseek(ovfd, off as i64, libc::SEEK_DATA) };
-                if data < 0 {
-                    break; // ENXIO: no more data extents
-                }
-                // SAFETY: as above.
-                let hole = unsafe { libc::lseek(ovfd, data, libc::SEEK_HOLE) };
-                if hole < 0 {
-                    break;
-                }
-                let (d, h) = (data as u64, hole as u64);
-                // Map the dense file offset back to a GPA through the same range
-                // table the writer used, so an overlay can only be applied to the
-                // layout it was produced against.
-                let mut cur: u64 = 0;
-                for range in saved_regions.regions() {
-                    let r_start = cur;
-                    let r_end = cur + range.length;
-                    cur = r_end;
-                    let s = d.max(r_start);
-                    let e = h.min(r_end);
-                    if s >= e {
-                        continue;
-                    }
-                    let gpa = range.gpa + (s - r_start);
-                    let len = (e - s) as usize;
-                    let mut buf = vec![0u8; len];
-                    use std::os::unix::fs::FileExt as _;
-                    ovf.read_exact_at(&mut buf, s).map_err(Error::SnapshotRead)?;
-                    guest_memory
-                        .write_slice(&buf, GuestAddress(gpa))
-                        .map_err(|_| {
-                            Error::SnapshotRead(io::Error::other("overlay write_slice failed"))
-                        })?;
-                    applied += len as u64;
-                }
-                off = h;
-            }
-            arker_delta_report(&format!(
-                "CHDELTA overlay applied: {} MiB in {:.0}ms over base {}",
-                applied / 1048576,
-                t0.elapsed().as_secs_f64() * 1000.0,
-                map_path.display()
-            ));
+            Self::arker_apply_overlay(
+                &ov,
+                saved_regions,
+                &guest_memory,
+                &map_path.display().to_string(),
+            )?;
         }
 
+        Ok(())
+    }
+
+    /// Lay a delta overlay's written extents over memory already holding the base.
+    ///
+    /// Shared by BOTH restore modes. COW maps the base and copies-on-write here;
+    /// an EAGER restore fills the base into private anon first and then calls this,
+    /// which keeps eager's defining property -- every page present before resume,
+    /// so a nested L2 VMRESUME never takes a fault -- while still paying only the
+    /// delta on capture. Without this an eager child restored the sparse overlay
+    /// ALONE and came up with holes for every unchanged page.
+    ///
+    /// Extents are found with SEEK_DATA/SEEK_HOLE, never by trusting a length: the
+    /// file is deliberately sparse and its holes mean "unchanged, keep the base".
+    /// Reading them as zeros is exactly the silent corruption this design avoids.
+    fn arker_apply_overlay(
+        overlay: &Path,
+        saved_regions: &MemoryRangeTable,
+        guest_memory: &GuestMemoryMmap,
+        base_label: &str,
+    ) -> Result<(), Error> {
+        use std::os::fd::AsRawFd;
+        let t0 = std::time::Instant::now();
+        let ovf = File::open(overlay).map_err(Error::SnapshotOpen)?;
+        let ovfd = ovf.as_raw_fd();
+        let end = ovf.metadata().map_err(Error::SnapshotOpen)?.len();
+        let mut applied: u64 = 0;
+        let mut off: u64 = 0;
+        while off < end {
+            // SAFETY: FFI lseek on an owned fd; both whences are valid.
+            let data = unsafe { libc::lseek(ovfd, off as i64, libc::SEEK_DATA) };
+            if data < 0 {
+                break; // ENXIO: no more data extents
+            }
+            // SAFETY: as above.
+            let hole = unsafe { libc::lseek(ovfd, data, libc::SEEK_HOLE) };
+            if hole < 0 {
+                break;
+            }
+            let (d, h) = (data as u64, hole as u64);
+            // Map the dense file offset back to a GPA through the same range
+            // table the writer used, so an overlay can only be applied to the
+            // layout it was produced against.
+            let mut cur: u64 = 0;
+            for range in saved_regions.regions() {
+                let r_start = cur;
+                let r_end = cur + range.length;
+                cur = r_end;
+                let s = d.max(r_start);
+                let e = h.min(r_end);
+                if s >= e {
+                    continue;
+                }
+                let gpa = range.gpa + (s - r_start);
+                let len = (e - s) as usize;
+                let mut buf = vec![0u8; len];
+                use std::os::unix::fs::FileExt as _;
+                ovf.read_exact_at(&mut buf, s).map_err(Error::SnapshotRead)?;
+                guest_memory
+                    .write_slice(&buf, GuestAddress(gpa))
+                    .map_err(|_| {
+                        Error::SnapshotRead(io::Error::other("overlay write_slice failed"))
+                    })?;
+                applied += len as u64;
+            }
+            off = h;
+        }
+        arker_delta_report(&format!(
+            "CHDELTA overlay applied: {} MiB in {:.0}ms over base {}",
+            applied / 1048576,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            base_label
+        ));
         Ok(())
     }
 
@@ -2013,9 +2041,47 @@ impl MemoryManager {
                     .unwrap()
                     .restore_by_cow_mmap(&memory_file_path, &mem_snapshot.memory_ranges)?;
             } else {
-                mm.lock()
-                    .unwrap()
-                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                // EAGER restore, and it must understand overlays too.
+                //
+                // `memory_restore_mode=copy` reads this file as the WHOLE of guest
+                // RAM. Handed a sparse delta that means holes for every unchanged
+                // page, so the guest came up with blank RAM: measured on nestedvirt
+                // as 4/4 forks whose agent never answered (vsock 52 CONNECT failed,
+                // runs exit 124). Nested restores are eager BY CONSTRUCTION -- a COW
+                // fault taken inside an L2 VMRESUME kills qemu -- so nested was
+                // exactly the population a default-on delta broke.
+                //
+                // Fill the BASE densely, then lay the overlay over it. Every page is
+                // present and private before resume, which is the property eager
+                // exists for, and capture still pays only the delta.
+                let mut mmg = mm.lock().unwrap();
+                match arker_overlay_base(&memory_file_path) {
+                    Some(Ok(base)) => {
+                        let base_label = base.display().to_string();
+                        mmg.fill_saved_regions(base, &mem_snapshot.memory_ranges)?;
+                        let gm = mmg.guest_memory.memory();
+                        MemoryManager::arker_apply_overlay(
+                            &memory_file_path,
+                            &mem_snapshot.memory_ranges,
+                            &gm,
+                            &base_label,
+                        )?;
+                    }
+                    // Refuse rather than guess, exactly as the COW path does: an
+                    // overlay without its base restores holes as zeros.
+                    Some(Err(missing)) => {
+                        return Err(Error::SnapshotOpen(std::io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "overlay image {} needs base {missing}, which is absent",
+                                memory_file_path.display()
+                            ),
+                        )));
+                    }
+                    None => {
+                        mmg.fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                    }
+                }
             }
 
             Ok(mm)
