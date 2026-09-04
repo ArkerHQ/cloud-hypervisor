@@ -3477,6 +3477,7 @@ struct ArkerFiemap {
     fm_reserved: u32,
 }
 
+#[allow(dead_code)] // retained: see the note at its call site
 fn arker_extent_count(path: &Path) -> Option<u32> {
     use std::os::unix::io::AsRawFd;
     const FS_IOC_FIEMAP: u64 = 0xc020_660b;
@@ -3703,14 +3704,20 @@ impl Transportable for MemoryManager {
                 // then neither of this branch's two exhaustive reports, so the
                 // stall is between them -- these two lines say whether it is the
                 // ioctl (or the open) rather than anything after it.
-                arker_delta_report("CHDELTA probe: counting base extents");
-                let t_ext = std::time::Instant::now();
-                let extents = arker_extent_count(base);
-                arker_delta_report(&format!(
-                    "CHDELTA probe: extents={:?} in {:.0}ms",
-                    extents,
-                    t_ext.elapsed().as_secs_f64() * 1000.0
-                ));
+                // NO FIEMAP HERE. Measured: the count itself never returns.
+                // `fm_extent_count = 0` still walks the extent b-tree, so counting
+                // is O(extents) exactly like the FICLONE it was meant to protect --
+                // the probe reproduced the very hang it was added to diagnose
+                // ('probe: counting base extents' logged, no result line, ever).
+                //
+                // That is the real finding: these images carry a pathological
+                // extent count. An 8 GiB snapshot written range-by-range into a
+                // sparse file can hold ~10^6 extents, and every extent-tree
+                // operation on it -- count, reflink, last-close trim -- is
+                // proportional. Reflink-and-patch is the wrong shape for this
+                // storage layout, not merely mistuned.
+                let extents: Option<u32> = None;
+                let too_fragmented = false;
                 let too_fragmented = extents.is_some_and(|n| n > ARKER_MAX_BASE_EXTENTS);
                 let refuse = !layout_ok || too_fragmented;
                 if refuse {
