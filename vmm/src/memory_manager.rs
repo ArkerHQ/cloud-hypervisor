@@ -1110,25 +1110,30 @@ impl MemoryManager {
         guest_memory: &GuestMemoryMmap,
         base_label: &str,
     ) -> Result<(), Error> {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::AsFd;
         let t0 = std::time::Instant::now();
         let ovf = File::open(overlay).map_err(Error::SnapshotOpen)?;
-        let ovfd = ovf.as_raw_fd();
         let end = ovf.metadata().map_err(Error::SnapshotOpen)?.len();
         let mut applied: u64 = 0;
         let mut off: u64 = 0;
-        while off < end {
-            // SAFETY: FFI lseek on an owned fd; both whences are valid.
-            let data = unsafe { libc::lseek(ovfd, off as i64, libc::SEEK_DATA) };
-            if data < 0 {
-                break; // ENXIO: no more data extents
-            }
-            // SAFETY: as above.
-            let hole = unsafe { libc::lseek(ovfd, data, libc::SEEK_HOLE) };
-            if hole < 0 {
-                break;
-            }
-            let (d, h) = (data as u64, hole as u64);
+        // `next_data_extent` rather than a second hand-rolled lseek loop: it is the
+        // same walk the write side already uses and unit-tests, it separates ENXIO
+        // ("no more data") from a real failure, and it clamps to `end`.
+        //
+        // The error is PROPAGATED, not broken out of. Treating an lseek failure as
+        // "done" would apply a PARTIAL overlay over the base and resume a guest
+        // holding a half-updated image -- silent memory corruption, and exactly the
+        // failure mode the holes-mean-unchanged design exists to avoid. A
+        // filesystem without SEEK_HOLE must fail the restore loudly instead.
+        while let Some((d, extent_len)) = next_data_extent(ovf.as_fd(), off, end)
+            .map_err(|e| {
+                Error::SnapshotRead(io::Error::other(format!(
+                    "overlay {} extent walk failed at {off}: {e}",
+                    overlay.display()
+                )))
+            })?
+        {
+            let h = d + extent_len;
             // Map the dense file offset back to a GPA through the same range
             // table the writer used, so an overlay can only be applied to the
             // layout it was produced against.
