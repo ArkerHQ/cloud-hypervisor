@@ -3594,11 +3594,30 @@ pub(crate) fn arker_delta_enabled() -> bool {
 /// 0.21–0.24s throughout. So this is roughly +2.1s on the first fork of a VM,
 /// and nothing thereafter.
 ///
-/// This is still not the final answer. The fix that keeps both is to DENSIFY AT
-/// PUBLISH — merge base+overlay when uploading — so local forks keep the 0.46s
-/// and only a migration pays. Until that exists, correctness wins over the
-/// capture time, because the failure mode is a migrated VM losing all of its
-/// memory.
+/// This is still not the final answer. The fix that keeps both is to make only
+/// the PUBLISH-destined capture dense, so local forks keep the 0.46s and only a
+/// migration pays. Two routes, both scouted:
+///
+///   A. Carry intent to the capture. `vm_snapshot(&mut self, destination_url)`
+///      already receives the destination, so arkerd could mark it (e.g. a
+///      `?arker_dense=1` suffix stripped here before `vm.send`) and this gate
+///      would honour it per-snapshot. The obstacle is host-side, not here:
+///      `RuntimeManager::snapshot(&self, runtime_id, dest_dir)` is a TRAIT
+///      method shared by the fork and evict paths with nowhere to put intent,
+///      so it means changing the trait and every implementor (FC, gVisor, mac).
+///
+///   B. Densify at publish instead. `snapshot_sync` is the single place that
+///      knows portability is required — it resolves `dir.join("mem")` for
+///      upload — so it could merge base+overlay there. Needs a real
+///      SEEK_DATA/SEEK_HOLE merge and an 8 GiB temp, and must FAIL CLOSED:
+///      publishing a half-merged image is the bug this whole comment is about.
+///
+/// B is the smaller blast radius (one call site, no trait change). Either way,
+/// `test_crosshost_windows.py` is the detector — it was red for exactly this
+/// and is green now, so an attempt is verifiable rather than a leap.
+///
+/// Until one of them exists, correctness wins over the capture time, because
+/// the failure mode is a migrated VM losing all of its memory.
 ///
 /// Scoping this per-snapshot instead is not available: this reads the CH
 /// PROCESS env, fixed at spawn, and any VM may later be asked to migrate.
