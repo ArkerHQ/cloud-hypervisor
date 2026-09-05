@@ -3570,11 +3570,34 @@ pub(crate) fn arker_delta_enabled() -> bool {
     delta_enabled(std::env::var("ARKER_CH_DELTA").ok().as_deref())
 }
 
-/// `ARKER_CH_DELTA` — only an explicit "0" disables; absent or anything else is
-/// on, so a stale `ARKER_CH_DELTA=1` in a config keeps working unchanged. Same
-/// pure-predicate shape as `cow_enabled`.
+/// `ARKER_CH_DELTA` — OFF unless explicitly "1". Same pure-predicate shape as
+/// `cow_enabled`.
+///
+/// This defaulted ON, and that broke cross-host migration outright. A delta
+/// snapshot writes only the dirty pages, plus a `<image>.layout` sidecar naming
+/// the base the rest of the pages live in. Locally that is complete: the base is
+/// the golden sitting in the next directory. PUBLISHED it is not — the sidecar
+/// is not uploaded, the base is not uploaded, and neither could help anyway
+/// because each host BAKES ITS OWN golden (measured: the two hosts' Windows
+/// golden RAM differ, 238056a2… vs 3ece9f6d…).
+///
+/// So the destination received an 8 GiB image holding ~590 MB of real pages,
+/// mapped 7.4 GiB of holes as zeros, and the guest triple-faulted 0.1s into
+/// resume — CPU reset, cold boot, every trace of the migrated VM's RAM gone.
+/// Turning this off makes the snapshot dense and the move work: 3/3 passes,
+/// with the seeded nonce surviving.
+///
+/// The cost is real and this is not the final answer: delta capture is what took
+/// a fork's first snapshot from 2.32s to 0.46s. The fix that keeps both is to
+/// DENSIFY AT PUBLISH — merge base+overlay when uploading — so local forks stay
+/// fast and only a migration pays. That needs building; until it exists,
+/// correctness wins over the capture time, because the failure mode is a
+/// migrated VM losing all of its memory.
+///
+/// Scoping this per-snapshot instead is not available: this reads the CH
+/// PROCESS env, fixed at spawn, and any VM may later be asked to migrate.
 fn delta_enabled(env: Option<&str>) -> bool {
-    env != Some("0")
+    env == Some("1")
 }
 
 /// Report a delta line to BOTH stderr and a fixed path.
@@ -4367,11 +4390,14 @@ mod unit_tests {
     // explicitly disabled, COW is off unless explicitly enabled. Reading either
     // one inline a second time is how they silently diverge.
     #[test]
-    fn delta_is_on_unless_explicitly_zero() {
-        assert!(delta_enabled(None));
+    fn delta_is_off_unless_explicitly_one() {
+        // Was "on unless explicitly 0". Defaulting on published a sparse
+        // overlay whose base cannot cross hosts, and the migrated guest
+        // triple-faulted into a cold boot.
+        assert!(!delta_enabled(None));
         assert!(delta_enabled(Some("1")));
-        assert!(delta_enabled(Some("")));
-        assert!(delta_enabled(Some("yes")));
+        assert!(!delta_enabled(Some("")));
+        assert!(!delta_enabled(Some("yes")));
         assert!(!delta_enabled(Some("0")));
     }
 
