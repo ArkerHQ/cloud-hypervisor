@@ -3587,12 +3587,18 @@ pub(crate) fn arker_delta_enabled() -> bool {
 /// Turning this off makes the snapshot dense and the move work: 3/3 passes,
 /// with the seeded nonce surviving.
 ///
-/// The cost is real and this is not the final answer: delta capture is what took
-/// a fork's first snapshot from 2.32s to 0.46s. The fix that keeps both is to
-/// DENSIFY AT PUBLISH — merge base+overlay when uploading — so local forks stay
-/// fast and only a migration pays. That needs building; until it exists,
-/// correctness wins over the capture time, because the failure mode is a
-/// migrated VM losing all of its memory.
+/// The cost is real, bounded, and MEASURED. Delta capture took a fork's first
+/// snapshot from 2.32s to 0.46s; with it off, three fresh Windows parents forked
+/// in 2.61 / 2.51 / 2.65s. It is paid ONCE PER PARENT — the second and third
+/// fork of the same parent were 0.04–0.05s, and a child's first run stayed
+/// 0.21–0.24s throughout. So this is roughly +2.1s on the first fork of a VM,
+/// and nothing thereafter.
+///
+/// This is still not the final answer. The fix that keeps both is to DENSIFY AT
+/// PUBLISH — merge base+overlay when uploading — so local forks keep the 0.46s
+/// and only a migration pays. Until that exists, correctness wins over the
+/// capture time, because the failure mode is a migrated VM losing all of its
+/// memory.
 ///
 /// Scoping this per-snapshot instead is not available: this reads the CH
 /// PROCESS env, fixed at spawn, and any VM may later be asked to migrate.
