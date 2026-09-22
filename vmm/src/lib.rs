@@ -1845,7 +1845,8 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
     let resumed = vm.resume();
     // Reported AFTER the resume so it spans the whole window the guest was gone.
     crate::memory_manager::arker_delta_report(&format!(
-        "CHLIVE downtime: {:.1}ms",
+        "CHLIVE downtime: pid={} {:.1}ms",
+        std::process::id(),
         downtime_begin.elapsed().as_secs_f64() * 1000.0
     ));
     result.and(resumed.map_err(VmError::Resume))

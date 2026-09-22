@@ -3007,7 +3007,28 @@ impl MemoryManager {
         ranges: &MemoryRangeTable,
         presize: bool,
     ) -> result::Result<(), MigratableError> {
-        if self.snapshot_memory_ranges.is_empty() {
+        // The dense LAYOUT, computed here rather than read from
+        // `self.snapshot_memory_ranges`.
+        //
+        // That field is assigned inside `MemoryManager::snapshot`, which a live
+        // capture has not called yet when it pre-copies -- the pre-copy runs
+        // BEFORE the pause, and `snapshot()` requires the pause. So reading it
+        // here returns whatever the PREVIOUS capture left behind: empty on a
+        // VM's first snapshot (pre-copy silently writes nothing) and stale on
+        // every one after.
+        //
+        // MEASURED: a first capture logged a downtime with no write lines at
+        // all, because the early-return fired. The captures that appeared to
+        // work were the ones whose field happened to be populated from an
+        // earlier snapshot.
+        //
+        // `memory_range_table(false)` is the same MIGRATION view the pre-copy
+        // reads from and the authoritative description of the guest's regions
+        // right now. `(true)` would be wrong for a second reason: it skips
+        // regions upstream believes a backing file covers, which is exactly
+        // what ARKER_CH_COW invalidates.
+        let layout = self.memory_range_table(false)?;
+        if layout.is_empty() {
             return Ok(());
         }
         let mut memory_file_path = url_to_path(destination_url)?;
@@ -3022,12 +3043,7 @@ impl MemoryManager {
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         if presize {
-            let total_len: u64 = self
-                .snapshot_memory_ranges
-                .regions()
-                .iter()
-                .map(|r| r.length)
-                .sum();
+            let total_len: u64 = layout.regions().iter().map(|r| r.length).sum();
             // Best-effort, as the dense path treats it: a filesystem that
             // refuses ftruncate-extend still gets a complete image, because
             // every region below is written at its own offset anyway.
@@ -3041,7 +3057,7 @@ impl MemoryManager {
         let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
         let mut written: u64 = 0;
-        for region in self.snapshot_memory_ranges.regions() {
+        for region in layout.regions() {
             for (dgpa, dlen) in arker_dirty_overlaps(ranges, region.gpa, region.length) {
                 let at = file_cursor + (dgpa - region.gpa);
                 memory_file
@@ -3069,8 +3085,13 @@ impl MemoryManager {
             }
             file_cursor += region.length;
         }
+        // pid, because every cloud-hypervisor process on the host appends to
+        // this one file. Without it, concurrent snapshots interleave and a
+        // reader pairs a downtime with another VM's write -- which is how
+        // "348MB in 5.1ms" nearly got reported as a result.
         arker_delta_report(&format!(
-            "CHLIVE write: presize={presize} extents={} bytes={written}",
+            "CHLIVE write: pid={} presize={presize} extents={} bytes={written}",
+            std::process::id(),
             ranges.regions().len()
         ));
         Ok(())
