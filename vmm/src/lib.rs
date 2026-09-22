@@ -1818,12 +1818,31 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
         return Err(VmError::SnapshotSend(e));
     }
 
-    // Downtime starts HERE, and is the number this whole path exists to move.
-    // Measured rather than inferred: the bytes pass 2 writes say how much work
-    // the pause covers, not how long the guest was gone. Those are different
-    // questions, and only the second one is what a caller feels.
+    // The caller may ALREADY have paused this VM, and that is not an error.
+    //
+    // arkerd's `create_snapshot` no longer pauses, but the FORK path pauses its
+    // source before snapshotting it, so a live capture arrives at a guest that
+    // is already stopped. `vm.pause()` answers that with
+    // `InvalidStateTransition(Paused, Paused)` and the old blocking path simply
+    // tolerated it -- `remote::pause` is documented idempotent for exactly this
+    // reason. Propagating it instead broke every Linux CH fork:
+    //
+    //   ch-remote snapshot failed: Cannot pause VM / Failed to pause migratable
+    //   component / Invalid transition: InvalidStateTransition(Paused, Paused)
+    //
+    // Windows hid it. An agentless guest is RESUMED by the fs quiesce so it can
+    // flush, so CH always saw it running; a Linux guest has no quiesce and
+    // arrives paused every time. MEASURED: 4/4 fork attempts pre-copied and
+    // then died here, with no pass 2 and no downtime line.
+    //
+    // Pause only what we paused, and resume only that. Leaving a
+    // caller-paused VM running on the way out would hand it back in a state it
+    // did not ask for.
+    let already_paused = matches!(vm.get_state(), VmState::Paused);
     let downtime_begin = std::time::Instant::now();
-    vm.pause().map_err(VmError::Pause)?;
+    if !already_paused {
+        vm.pause().map_err(VmError::Pause)?;
+    }
     let result = (|| {
         let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
         vm.arker_write_dirty_memory(destination_url, &dirty)
@@ -1833,7 +1852,13 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
             .map_err(VmError::SnapshotSend)
     })();
     let _ = vm.stop_dirty_log();
-    let resumed = vm.resume();
+    // Symmetric with the pause above: a VM the caller handed us paused stays
+    // paused.
+    let resumed = if already_paused {
+        Ok(())
+    } else {
+        vm.resume()
+    };
     // Reported AFTER the resume so it spans the whole window the guest was gone.
     crate::memory_manager::arker_delta_report(&format!(
         "CHLIVE downtime: pid={} {:.1}ms",
