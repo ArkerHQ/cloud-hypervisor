@@ -1827,6 +1827,11 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
         return Err(VmError::SnapshotSend(e));
     }
 
+    // Downtime starts HERE, and is the number this whole path exists to move.
+    // Measured rather than inferred: the bytes pass 2 writes say how much work
+    // the pause covers, not how long the guest was gone. Those are different
+    // questions, and only the second one is what a caller feels.
+    let downtime_begin = std::time::Instant::now();
     vm.pause().map_err(VmError::Pause)?;
     let result = (|| {
         let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
@@ -1838,6 +1843,11 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
     })();
     let _ = vm.stop_dirty_log();
     let resumed = vm.resume();
+    // Reported AFTER the resume so it spans the whole window the guest was gone.
+    crate::memory_manager::arker_delta_report(&format!(
+        "CHLIVE downtime: {:.1}ms",
+        downtime_begin.elapsed().as_secs_f64() * 1000.0
+    ));
     result.and(resumed.map_err(VmError::Resume))
 }
 
