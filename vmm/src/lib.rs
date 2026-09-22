@@ -41,7 +41,7 @@ use vm_memory::bitmap::AtomicBitmap;
 use vm_migration::protocol::*;
 use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
-    Snapshot, Snapshottable, Transportable,
+    Snapshot, Snapshottable,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
@@ -1793,15 +1793,6 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
     Ok(())
 }
 
-/// `ARKER_CH_LIVE` — opt-in, so ONLY "1" enables, matching `ARKER_CH_COW`.
-///
-/// Process env, read at spawn, like every other ARKER_CH_* knob: a VM may
-/// be asked to snapshot at any time and there is nowhere per-call to put
-/// intent (see `delta_enabled`'s note on the same problem).
-fn arker_live_snapshot_enabled() -> bool {
-    std::env::var("ARKER_CH_LIVE").as_deref() == Ok("1")
-}
-
 /// The two-pass capture. Ordering here is the whole correctness argument:
 ///
 ///   1. `start_dirty_log` FIRST, so nothing the pre-copy races is missed.
@@ -2059,15 +2050,15 @@ impl RequestHandler for Vmm {
             //
             // Unlike the blocking path this does its OWN pause/resume, so the
             // caller must NOT pre-pause (same contract as FC's LiveFull).
-            if arker_live_snapshot_enabled() {
-                return arker_vm_snapshot_live(vm, destination_url);
-            }
-            vm.snapshot()
-                .map_err(VmError::Snapshot)
-                .and_then(|snapshot| {
-                    vm.send(&snapshot, destination_url)
-                        .map_err(VmError::SnapshotSend)
-                })
+            // The ONLY capture path. Memory is copied while the guest runs and
+            // the vCPUs stop only for what changed during that copy.
+            //
+            // There is no blocking fallback on purpose. A second path would be
+            // one nothing exercises -- every caller reaches this function, so a
+            // fallback would rot untested until the day it ran. `Vm::send` and
+            // `MemoryManager::send` still exist to satisfy `Transportable`, but
+            // nothing on the snapshot path calls them any more.
+            arker_vm_snapshot_live(vm, destination_url)
         } else {
             Err(VmError::VmNotRunning)
         }

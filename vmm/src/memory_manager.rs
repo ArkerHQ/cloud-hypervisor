@@ -3001,6 +3001,10 @@ impl MemoryManager {
     ///
     /// `presize` belongs to pass 1 only: `set_len` on pass 2 would truncate the
     /// image pass 1 just wrote.
+    ///
+    /// This is now the only way a snapshot's memory reaches disk --
+    /// `MemoryManager::send` remains to satisfy `Transportable`, but nothing
+    /// on the snapshot path calls it.
     pub fn arker_write_ranges(
         &self,
         destination_url: &str,
