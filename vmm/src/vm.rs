@@ -3062,6 +3062,79 @@ impl Vm {
         Ok(())
     }
 
+    /// ARKER LIVE: pre-copy every guest region into the destination's memory
+    /// file while the vCPUs are still RUNNING.
+    ///
+    /// `memory_range_table(false)` is the MIGRATION view, deliberately: the
+    /// `true` (snapshot) view skips regions upstream believes are covered by a
+    /// backing file, which is exactly the assumption `ARKER_CH_COW` invalidates.
+    /// The migration view is the one live migration itself pre-copies from.
+    pub fn arker_precopy_memory(
+        &self,
+        destination_url: &str,
+    ) -> std::result::Result<(), MigratableError> {
+        let mm = self.memory_manager.lock().unwrap();
+        let table = mm.memory_range_table(false)?;
+        mm.arker_write_ranges(destination_url, &table, true)
+    }
+
+    /// ARKER LIVE: lay the post-pause dirty set over the pre-copied image.
+    ///
+    /// No `presize`: the file already exists at full length and `set_len` here
+    /// would truncate what the pre-copy just wrote.
+    pub fn arker_write_dirty_memory(
+        &self,
+        destination_url: &str,
+        table: &MemoryRangeTable,
+    ) -> std::result::Result<(), MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .arker_write_ranges(destination_url, table, false)
+    }
+
+    /// ARKER LIVE: write the config and device/vCPU state, WITHOUT the memory.
+    ///
+    /// `Transportable::send` writes all three and ends by calling
+    /// `MemoryManager::send`, which lays a full dense image. A live capture has
+    /// already written the memory in two passes, so calling it would dump all
+    /// of guest RAM a second time with the vCPUs stopped -- reintroducing the
+    /// exact cost this path exists to remove.
+    pub fn arker_send_state_only(
+        &self,
+        snapshot: &Snapshot,
+        destination_url: &str,
+    ) -> std::result::Result<(), MigratableError> {
+        let mut snapshot_config_path = url_to_path(destination_url)?;
+        snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
+        let mut snapshot_config_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(snapshot_config_path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        snapshot_config_file
+            .write(vm_config.as_bytes())
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        let mut snapshot_state_path = url_to_path(destination_url)?;
+        snapshot_state_path.push(SNAPSHOT_STATE_FILE);
+        let mut snapshot_state_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(snapshot_state_path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        let vm_state =
+            serde_json::to_vec(snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        snapshot_state_file
+            .write(&vm_state)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        Ok(())
+    }
+
     pub fn memory_range_table(&self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         self.memory_manager
             .lock()

@@ -2977,6 +2977,104 @@ impl MemoryManager {
         debug!("coredump total bytes {total_bytes}");
         Ok(())
     }
+
+    /// ARKER LIVE: write `ranges` into the destination's memory file at their
+    /// dense offsets.
+    ///
+    /// The one primitive a live snapshot needs, deliberately the same shape as
+    /// the dense dump in `send`: seek to the dense offset, `write_volatile_to`
+    /// from the guest VA. A live capture calls it TWICE against one file --
+    ///
+    ///   1. every region, while the vCPUs are still RUNNING (the pre-copy), and
+    ///   2. only the dirty set, after the pause,
+    ///
+    /// -- so pass 2 overwrites exactly the pages pass 1 raced. Same file, same
+    /// offsets, so the result is byte-identical to a dense dump taken at the
+    /// moment of the pause and the restore path needs no knowledge that it was
+    /// built in two passes.
+    ///
+    /// Reads the GUEST VA, not the backing file. Not incidental: under
+    /// `ARKER_CH_COW` the regions are overmapped MAP_PRIVATE|MAP_FIXED, so
+    /// guest writes land on anonymous COW pages the file never sees and the VA
+    /// is the only authoritative source. Reading anything else here is the bug
+    /// that cost a forked child all of its RAM.
+    ///
+    /// `presize` belongs to pass 1 only: `set_len` on pass 2 would truncate the
+    /// image pass 1 just wrote.
+    pub fn arker_write_ranges(
+        &self,
+        destination_url: &str,
+        ranges: &MemoryRangeTable,
+        presize: bool,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+        let mut memory_file_path = url_to_path(destination_url)?;
+        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+
+        let mut memory_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&memory_file_path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        if presize {
+            let total_len: u64 = self
+                .snapshot_memory_ranges
+                .regions()
+                .iter()
+                .map(|r| r.length)
+                .sum();
+            // Best-effort, as the dense path treats it: a filesystem that
+            // refuses ftruncate-extend still gets a complete image, because
+            // every region below is written at its own offset anyway.
+            let _ = memory_file.set_len(total_len);
+        }
+
+        // The dense layout is defined by `snapshot_memory_ranges`, NOT by the
+        // table being written: a dirty range's file offset is its position in
+        // the FULL image. Walking the full list and mapping each dirty extent
+        // into it is what keeps pass 2 landing on the bytes pass 1 wrote.
+        let guest_memory = self.guest_memory.memory();
+        let mut file_cursor: u64 = 0;
+        let mut written: u64 = 0;
+        for region in self.snapshot_memory_ranges.regions() {
+            for (dgpa, dlen) in arker_dirty_overlaps(ranges, region.gpa, region.length) {
+                let at = file_cursor + (dgpa - region.gpa);
+                memory_file
+                    .seek(SeekFrom::Start(at))
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                let mut off: u64 = 0;
+                while off < dlen {
+                    let n = guest_memory
+                        .write_volatile_to(
+                            GuestAddress(dgpa + off),
+                            &mut memory_file,
+                            (dlen - off) as usize,
+                        )
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    // Same no-progress guard as the dense path: a zero-length
+                    // write is legal and would spin here forever.
+                    if n == 0 {
+                        return Err(MigratableError::MigrateSend(anyhow!(
+                            "arker live: no progress writing gpa={dgpa:#x} off={off} len={dlen}"
+                        )));
+                    }
+                    off += n as u64;
+                }
+                written += dlen;
+            }
+            file_cursor += region.length;
+        }
+        arker_delta_report(&format!(
+            "CHLIVE write: presize={presize} extents={} bytes={written}",
+            ranges.regions().len()
+        ));
+        Ok(())
+    }
 }
 
 struct MemoryNotify {

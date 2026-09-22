@@ -1793,6 +1793,54 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
     Ok(())
 }
 
+/// `ARKER_CH_LIVE` — opt-in, so ONLY "1" enables, matching `ARKER_CH_COW`.
+///
+/// Process env, read at spawn, like every other ARKER_CH_* knob: a VM may
+/// be asked to snapshot at any time and there is nowhere per-call to put
+/// intent (see `delta_enabled`'s note on the same problem).
+fn arker_live_snapshot_enabled() -> bool {
+    std::env::var("ARKER_CH_LIVE").as_deref() == Ok("1")
+}
+
+/// The two-pass capture. Ordering here is the whole correctness argument:
+///
+///   1. `start_dirty_log` FIRST, so nothing the pre-copy races is missed.
+///      Arming after would lose every page dirtied in between.
+///   2. pre-copy every region while RUNNING -- the expensive pass, and the
+///      guest never notices it.
+///   3. pause. Downtime starts here.
+///   4. `dirty_log()` CONSUMES the set it returns, so it is read exactly
+///      once and handed straight to the writer.
+///   5. lay those pages over the pre-copy at the same dense offsets.
+///   6. device + vCPU state, which requires the pause.
+///   7. resume. Downtime ends.
+///
+/// The guest is stopped for 4-6 only: the dirty delta, not 8 GiB.
+///
+/// Resume is best-effort on the failure paths deliberately. A capture that
+/// fails has already cost the caller its snapshot; leaving the guest paused
+/// on the way out would cost it the VM as well.
+fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<(), VmError> {
+    vm.start_dirty_log().map_err(VmError::Snapshot)?;
+    if let Err(e) = vm.arker_precopy_memory(destination_url) {
+        let _ = vm.stop_dirty_log();
+        return Err(VmError::SnapshotSend(e));
+    }
+
+    vm.pause().map_err(VmError::Pause)?;
+    let result = (|| {
+        let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
+        vm.arker_write_dirty_memory(destination_url, &dirty)
+            .map_err(VmError::SnapshotSend)?;
+        let snapshot = vm.snapshot().map_err(VmError::Snapshot)?;
+        vm.arker_send_state_only(&snapshot, destination_url)
+            .map_err(VmError::SnapshotSend)
+    })();
+    let _ = vm.stop_dirty_log();
+    let resumed = vm.resume();
+    result.and(resumed.map_err(VmError::Resume))
+}
+
 impl RequestHandler for Vmm {
     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
@@ -1986,6 +2034,23 @@ impl RequestHandler for Vmm {
             // `arker_publish_delta` accumulates instead, so the published set is
             // always "changed since the base". FC can re-arm because it ADVANCES
             // its base file (mem.base) in the same paired step; we do not.
+            // ── ARKER LIVE ───────────────────────────────────────────────
+            // Capture memory while the guest RUNS, then stop it only for the
+            // pages that changed during that copy. FC has done this since its
+            // `LiveFull` patch; CH never had it, and inherited the blocking
+            // path for every caller through the default `snapshot_live`.
+            //
+            // MEASURED on ovh-hil-01, an 8 GiB Windows guest: the dense dump
+            // costs ~6.8s with the vCPUs stopped, while only 200-750MB of that
+            // 8 GiB is ever dirty. Everything the two-pass version needs is
+            // already here and proven -- `do_memory_iterations` pre-copies
+            // exactly this way for live migration.
+            //
+            // Unlike the blocking path this does its OWN pause/resume, so the
+            // caller must NOT pre-pause (same contract as FC's LiveFull).
+            if arker_live_snapshot_enabled() {
+                return arker_vm_snapshot_live(vm, destination_url);
+            }
             vm.snapshot()
                 .map_err(VmError::Snapshot)
                 .and_then(|snapshot| {
