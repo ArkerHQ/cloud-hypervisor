@@ -3116,7 +3116,7 @@ impl Vm {
         let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
         snapshot_config_file
-            .write(vm_config.as_bytes())
+            .write_all(vm_config.as_bytes())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         let mut snapshot_state_path = url_to_path(destination_url)?;
@@ -3130,7 +3130,7 @@ impl Vm {
         let vm_state =
             serde_json::to_vec(snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
         snapshot_state_file
-            .write(&vm_state)
+            .write_all(&vm_state)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
         Ok(())
     }

@@ -1975,34 +1975,10 @@ impl RequestHandler for Vmm {
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             vm.resume().map_err(VmError::Resume)?;
-            // Arm dirty tracking ONCE per process, not on every resume.
-            //
-            // `MemoryManager::start_dirty_log` RESETS every region bitmap, and
-            // arkerd resumes after each snapshot (plus the eager-pause
-            // dispatcher pauses/resumes independently). Re-arming there would
-            // wipe every host-side bit recorded since the last `dirty_log()`
-            // read -- which is precisely the set the delta path accumulates,
-            // because ARKER_CH_SNAP_BASE is fixed for the process lifetime and
-            // the delta must stay "changed since the BASE", not "since the last
-            // resume". The KVM half is unaffected either way (re-arming with
-            // identical flags is a no-op), so this only protects the VMM half.
-            static ARKER_DIRTY_ARMED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if crate::memory_manager::arker_delta_enabled()
-                && !ARKER_DIRTY_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                match vm.start_dirty_log() {
-                    Ok(()) => crate::memory_manager::arker_delta_report(
-                        "CHDIRTY start_dirty_log OK (armed once)",
-                    ),
-                    Err(e) => {
-                        ARKER_DIRTY_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
-                        crate::memory_manager::arker_delta_report(&format!(
-                            "CHDIRTY start_dirty_log FAILED: {e:?}"
-                        ));
-                    }
-                }
-            }
+            // NO dirty-log arming here. `arker_vm_snapshot_live` arms and
+            // stops its own around each capture, so arming on resume is both
+            // redundant and a trap: it is the half that used to feed the
+            // retired accumulator.
             Ok(())
         } else {
             Err(VmError::VmNotRunning)
@@ -2013,54 +1989,17 @@ impl RequestHandler for Vmm {
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
-            // CHDIRTY / CHDELTA: read the dirty set ONCE. `dirty_log()` ends in
-            // `bitmap().get_and_reset()` and clears the KVM half, so it CONSUMES
-            // what it returns -- calling it twice would hand the second caller an
-            // empty set and silently drop those pages from the snapshot. One call,
-            // shared by the probe and the delta.
+            // NO dirty-log read here, deliberately.
             //
-            // Read here, with the vCPUs already paused by the snapshot path, so the
-            // set cannot grow between reading it and writing the memory file.
-            // SINGLE source of truth, shared with `send()`. This used to test
-            // `== Ok("1")` independently, so flipping the default to ON in
-            // `arker_delta_enabled()` and dropping ARKER_CH_DELTA from config.env
-            // left THIS gate false: nothing was ever published, `send()` found no
-            // pending delta, and every capture silently took the dense 8 GiB path
-            // (measured: 2272ms/3131ms vs 359ms when the delta fires). Two gates
-            // for one decision is how that divergence happened; there is now one.
-            let want_delta = crate::memory_manager::arker_delta_enabled();
-            let want_probe = std::env::var("ARKER_CH_DIRTYTEST").as_deref() == Ok("1");
-            if want_delta || want_probe {
-                match vm.dirty_log() {
-                    Ok(table) => {
-                        if want_probe {
-                            let pages: u64 =
-                                table.regions().iter().map(|r| r.length).sum::<u64>() / 4096;
-                            crate::memory_manager::arker_delta_report(&format!(
-                                "CHDIRTY dirty_log OK total_dirty_pages={} total_MB={}",
-                                pages,
-                                pages * 4096 / 1048576
-                            ));
-                        }
-                        if want_delta {
-                            crate::memory_manager::arker_publish_delta(table);
-                        }
-                    }
-                    // No dirty set means no delta: `send` finds nothing published
-                    // and takes the dense path, which is always correct.
-                    Err(e) => crate::memory_manager::arker_delta_report(&format!(
-                        "CHDIRTY dirty_log FAILED: {e:?}"
-                    )),
-                }
-            }
-            // NO re-arm here, deliberately. `ARKER_CH_SNAP_BASE` is fixed for the
-            // life of this process (env is set at spawn), so every snapshot is a
-            // delta against the RESTORE image. Re-arming would make the next read
-            // "dirty since the last snapshot" while the base stayed the restore
-            // image -- silently dropping everything dirtied before that snapshot.
-            // `arker_publish_delta` accumulates instead, so the published set is
-            // always "changed since the base". FC can re-arm because it ADVANCES
-            // its base file (mem.base) in the same paired step; we do not.
+            // This used to call `vm.dirty_log()` to feed a delta accumulator.
+            // `dirty_log()` CONSUMES the set it returns, and it ran immediately
+            // before `arker_vm_snapshot_live`, whose very first act is
+            // `start_dirty_log()`. So it burned a full bitmap read of the whole
+            // guest on every capture to populate a set that nothing reads any
+            // more -- the live path never calls `send()`. Its comment also
+            // claimed the vCPUs were "already paused by the snapshot path",
+            // which the live path made false: it does its own pause, after
+            // pre-copying while the guest runs.
             // ── ARKER LIVE ───────────────────────────────────────────────
             // Capture memory while the guest RUNS, then stop it only for the
             // pages that changed during that copy. FC has done this since its

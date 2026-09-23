@@ -3011,27 +3011,32 @@ impl MemoryManager {
         ranges: &MemoryRangeTable,
         presize: bool,
     ) -> result::Result<(), MigratableError> {
-        // The dense LAYOUT, computed here rather than read from
-        // `self.snapshot_memory_ranges`.
+        // The dense LAYOUT.
         //
-        // That field is assigned inside `MemoryManager::snapshot`, which a live
-        // capture has not called yet when it pre-copies -- the pre-copy runs
-        // BEFORE the pause, and `snapshot()` requires the pause. So reading it
-        // here returns whatever the PREVIOUS capture left behind: empty on a
-        // VM's first snapshot (pre-copy silently writes nothing) and stale on
-        // every one after.
+        // `(true)`, matching the RESTORE side exactly. `snapshot()` stores
+        // `memory_range_table(true)` into `snapshot_memory_ranges`, that goes
+        // into `MemoryManagerSnapshotData.memory_ranges`, and restore walks
+        // THAT to decide where each region lives in the file. The writer must
+        // use the same function, because the file is a bare concatenation with
+        // no per-region header: if `(true)` skips a region the writer kept,
+        // every region after it is read back from the wrong offset, silently
+        // and with no error anywhere.
         //
-        // MEASURED: a first capture logged a downtime with no write lines at
-        // all, because the early-return fired. The captures that appeared to
-        // work were the ones whose field happened to be populated from an
-        // earlier snapshot.
+        // `(false)` was used here and happened to be safe only because the
+        // skip additionally needs a MAP_SHARED hardlinked file mapping, which
+        // our restore modes do not produce. That is a coincidence, not a
+        // reason. Calling the same function the reader calls needs no such
+        // argument. (`arker_cow_enabled()` already disables the skip on its
+        // own, so COW is not what distinguishes the two tables.)
         //
-        // `memory_range_table(false)` is the same MIGRATION view the pre-copy
-        // reads from and the authoritative description of the guest's regions
-        // right now. `(true)` would be wrong for a second reason: it skips
-        // regions upstream believes a backing file covers, which is exactly
-        // what ARKER_CH_COW invalidates.
-        let layout = self.memory_range_table(false)?;
+        // Still computed here, NOT read from `self.snapshot_memory_ranges`:
+        // that field is assigned inside `MemoryManager::snapshot`, which a
+        // live capture has not called yet when it pre-copies (the pre-copy
+        // runs BEFORE the pause; `snapshot()` requires the pause). Reading it
+        // here returned whatever the PREVIOUS capture left: empty on a VM's
+        // first snapshot -- MEASURED as a downtime with no write lines at all
+        // -- and stale on every one after.
+        let layout = self.memory_range_table(true)?;
         if layout.is_empty() {
             return Ok(());
         }
@@ -3054,7 +3059,7 @@ impl MemoryManager {
             let _ = memory_file.set_len(total_len);
         }
 
-        // The dense layout is defined by `snapshot_memory_ranges`, NOT by the
+        // The dense layout is defined by `layout`, NOT by the
         // table being written: a dirty range's file offset is its position in
         // the FULL image. Walking the full list and mapping each dirty extent
         // into it is what keeps pass 2 landing on the bytes pass 1 wrote.
@@ -3620,9 +3625,12 @@ fn write_region_sparse(
 static ARKER_PENDING_DELTA: std::sync::Mutex<Option<MemoryRangeTable>> =
     std::sync::Mutex::new(None);
 
-/// Accumulate the dirty set for the snapshot about to run. Called from
-/// `vm_snapshot` with the vCPUs paused, so the set cannot grow underneath the
-/// write below.
+/// Accumulate the dirty set for the snapshot about to run.
+///
+/// NO LONGER CALLED. The live capture path never reads this accumulator, so
+/// `send()` below always finds it empty and takes the dense path -- which is
+/// always correct, just slower. Kept only because `send()` remains to satisfy
+/// `Transportable`; if that goes, this and `ARKER_PENDING_DELTA` go with it.
 ///
 /// ACCUMULATES rather than replaces, and that is load-bearing. CH's
 /// `dirty_log()` clears as it reads, while `ARKER_CH_SNAP_BASE` is fixed for the
