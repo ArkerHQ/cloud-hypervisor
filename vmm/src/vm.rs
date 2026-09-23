@@ -3100,6 +3100,14 @@ impl Vm {
     /// already written the memory in two passes, so calling it would dump all
     /// of guest RAM a second time with the vCPUs stopped -- reintroducing the
     /// exact cost this path exists to remove.
+    ///
+    /// The two file-writes below deliberately mirror upstream's rather than
+    /// factoring out a shared helper: sharing one would mean editing
+    /// `Transportable::send` too, and every line changed there is a line to
+    /// reconcile on the next rebase onto upstream. The copy is small, but it
+    /// IS a copy -- upstream's version still uses `write` where these use
+    /// `write_all`, and a short write truncates `state.json` into a device
+    /// state the restore cannot parse.
     pub fn arker_send_state_only(
         &self,
         snapshot: &Snapshot,
