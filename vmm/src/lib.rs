@@ -643,6 +643,13 @@ pub struct Vmm {
     console_resize_pipe: Option<Arc<File>>,
     console_info: Option<ConsoleInfo>,
     no_shutdown: bool,
+    /// ARKER LIVE: the memory image every capture of this VM writes its delta
+    /// over, or `None` when captures must be dense.
+    ///
+    /// Set at restore to the image we restored FROM and never changed after --
+    /// see `arker_vm_snapshot_live` for the extent measurement that rules out
+    /// advancing it.
+    arker_dirty_base: Option<std::path::PathBuf>,
 }
 
 /// Just a wrapper for the data that goes into
@@ -851,6 +858,7 @@ impl Vmm {
             console_resize_pipe: None,
             console_info: None,
             no_shutdown,
+            arker_dirty_base: None,
         })
     }
 
@@ -1811,33 +1819,123 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
 /// Resume is best-effort on the failure paths deliberately. A capture that
 /// fails has already cost the caller its snapshot; leaving the guest paused
 /// on the way out would cost it the VM as well.
-fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<(), VmError> {
-    // If the log was armed at RESTORE, this is the set that accumulated since then:
-    // what a since-restore pre-copy could write instead of the whole region. REPORTED
-    // ONLY -- the capture below is unchanged, so this cannot corrupt a snapshot.
-    //
-    // It must sit before `start_dirty_log`, and reading it is not destructive in any
-    // way that matters: `dirty_log()` CONSUMES the set, and the next line resets the
-    // bitmaps regardless.
-    if crate::memory_manager::arker_dirty_since_restore_enabled() {
+/// ARKER LIVE: capture `vm` into `destination_url` without stopping the guest for
+/// the whole image.
+///
+/// Two passes. Pass 1 runs with the vCPUs LIVE and writes either every region or,
+/// when arkerd has reflinked a base image into the destination, only what has
+/// changed since that base. Pass 2 stops the vCPUs just long enough to overwrite
+/// whatever pass 1 raced.
+///
+/// # The base is pinned, and nothing is remembered
+///
+/// Both dirty reads come from ONE epoch established at restore, and neither
+/// clears (KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 for the kernel's half,
+/// `arker_bitmap_snapshot` for vm-memory's). So this function keeps no state
+/// between captures: every fork off one parent re-reads "changed since the base"
+/// and writes that over a fresh reflink of the same base. A capture that dies
+/// half-written costs the next one nothing, because it consumed nothing.
+///
+/// The base is deliberately never advanced to a previous capture. `ficlone` costs
+/// O(source extents), and the two numbers that decide it were both MEASURED on
+/// ovh-hil-01:
+///
+/// * a `memory-ranges` written by the dense pass is **1 extent**
+///   (`size=8589934592 blocks=16777216`, `filefrag` -> `1 extent found`), because
+///   `set_len` plus one sequential sweep is what XFS lays down contiguously;
+/// * the dirty sets are **18,855-61,486 extents**, and writing those over freshly
+///   reflinked blocks makes XFS COW and split an extent per scattered write.
+///
+/// So a chained base would carry ~40k-120k extents by its first generation. This
+/// file already records where that ends: 'CHDELTA decide' logged and 'ficlone ok'
+/// never reached, no panic, no signal, no coredump -- a process wedged in the
+/// ioctl inside the snapshot HTTP handler, long enough for arkerd to reap the VM.
+/// `ARKER_DENSE_MARK` exists to enforce the same invariant from the other side.
+///
+/// The cost of pinning is that the delta grows with parent UPTIME rather than with
+/// the gap between forks (0.19 GiB dirty at t=10s, 3.53 GiB by ~100s on an 8 GiB
+/// Windows guest). Past half the image, scattered writes lose to one sequential
+/// sweep, so `too_dirty` gives up and goes dense.
+fn arker_vm_snapshot_live(
+    vm: &mut Vm,
+    destination_url: &str,
+    dirty_base: Option<&std::path::Path>,
+) -> result::Result<(), VmError> {
+    let pid = std::process::id();
+
+    // Whether this process put KVM's dirty log in manual-clear mode at VM
+    // creation. The same variable gates both, precisely so a non-destructive
+    // reader can never run against a log that still clears itself.
+    let manual = crate::memory_manager::arker_dirty_since_restore_enabled();
+
+    // Arming is upstream's behaviour and belongs only to it. In manual mode the
+    // log was armed once at restore -- that arming IS the epoch both reads below
+    // are relative to -- and re-arming here would reset it, throwing away
+    // everything the guest has dirtied since. Nothing stops it either: stopping
+    // is what made "since restore" a single-shot measurement, disarming after the
+    // first capture so every one after it read an empty set.
+    if !manual {
+        vm.start_dirty_log().map_err(VmError::Snapshot)?;
+    }
+
+    // Taken BEFORE pass 1 in manual mode, and it serves two purposes: it is what
+    // a delta pass 1 writes, and it is the floor pass 2 subtracts to find just
+    // the pages that moved during the copy.
+    let before = if manual {
         match vm.dirty_log() {
-            Ok(table) => {
-                let bytes: u64 = table.regions().iter().map(|r| r.length).sum();
+            Ok(table) => Some(table),
+            Err(e) => {
+                // Non-fatal: without it this is exactly the dense capture that
+                // ran before any of this existed.
                 crate::memory_manager::arker_delta_report(&format!(
-                    "CHSINCE restore: pid={} extents={} bytes={bytes}",
-                    std::process::id(),
-                    table.regions().len()
+                    "CHCLONE since: pid={pid} READ FAILED {e} — dense capture"
                 ));
+                None
             }
-            Err(e) => crate::memory_manager::arker_delta_report(&format!(
-                "CHSINCE restore: pid={} FAILED {e}",
-                std::process::id()
-            )),
+        }
+    } else {
+        None
+    };
+
+    // Can pass 1 write only the delta? Only if arkerd has already put a complete
+    // copy of the base in place, and only if the delta is still smaller than the
+    // dense sweep it replaces. Every "no" here falls back to a dense capture,
+    // which is always correct and merely slower.
+    let mut delta = None;
+    if let Some(before) = before.as_ref() {
+        let image_len = vm.arker_image_len().map_err(VmError::SnapshotSend)?;
+        let destination =
+            crate::migration::url_to_path(destination_url).map_err(VmError::SnapshotSend)?;
+        if crate::memory_manager::arker_base_is_reflinked(&destination, dirty_base, image_len) {
+            let bytes: u64 = before.regions().iter().map(|r| r.length).sum();
+            // Wall clock, not correctness: a scattered write costs a seek per
+            // extent, and overrunning arkerd's snapshot timeout reaps the VM
+            // mid-write, which is worse than being slow.
+            if bytes * 2 > image_len {
+                crate::memory_manager::arker_delta_report(&format!(
+                    "CHCLONE dense: pid={pid} dirty_MB={} of {}MB — too dirty",
+                    bytes / 1048576,
+                    image_len / 1048576
+                ));
+            } else {
+                crate::memory_manager::arker_delta_report(&format!(
+                    "CHCLONE delta: pid={pid} extents={} bytes={bytes}",
+                    before.regions().len()
+                ));
+                delta = Some(before);
+            }
         }
     }
-    vm.start_dirty_log().map_err(VmError::Snapshot)?;
-    if let Err(e) = vm.arker_precopy_memory(destination_url) {
-        let _ = vm.stop_dirty_log();
+
+    let dirty_only = delta.is_some();
+    let pass1 = match delta {
+        Some(table) => vm.arker_write_dirty_memory(destination_url, table),
+        None => vm.arker_precopy_memory(destination_url),
+    };
+    if let Err(e) = pass1 {
+        if !manual {
+            let _ = vm.stop_dirty_log();
+        }
         return Err(VmError::SnapshotSend(e));
     }
 
@@ -1867,25 +1965,31 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
         vm.pause().map_err(VmError::Pause)?;
     }
     let result = (|| {
-        let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
-        vm.arker_write_dirty_memory(destination_url, &dirty)
+        let now = vm.dirty_log().map_err(VmError::Snapshot)?;
+        // Subtract what pass 1 already wrote. Both reads share one epoch and
+        // neither clears, so `now` is a superset of `before` and the difference
+        // is exactly what the guest dirtied while pass 1 was copying. Writing
+        // `now` whole would be correct and would spend the whole delta again with
+        // the vCPUs stopped -- the downtime this path exists to avoid.
+        let pending = match before.as_ref() {
+            Some(before) => crate::memory_manager::arker_table_difference(&now, before),
+            None => now,
+        };
+        vm.arker_write_dirty_memory(destination_url, &pending)
             .map_err(VmError::SnapshotSend)?;
         let snapshot = vm.snapshot().map_err(VmError::Snapshot)?;
         vm.arker_send_state_only(&snapshot, destination_url)
             .map_err(VmError::SnapshotSend)
     })();
-    let _ = vm.stop_dirty_log();
+    if !manual {
+        let _ = vm.stop_dirty_log();
+    }
     // Symmetric with the pause above: a VM the caller handed us paused stays
     // paused.
-    let resumed = if already_paused {
-        Ok(())
-    } else {
-        vm.resume()
-    };
+    let resumed = if already_paused { Ok(()) } else { vm.resume() };
     // Reported AFTER the resume so it spans the whole window the guest was gone.
     crate::memory_manager::arker_delta_report(&format!(
-        "CHLIVE downtime: pid={} {:.1}ms",
-        std::process::id(),
+        "CHLIVE downtime: pid={pid} {:.1}ms dirty_only={dirty_only}",
         downtime_begin.elapsed().as_secs_f64() * 1000.0
     ));
     result.and(resumed.map_err(VmError::Resume))
@@ -2009,6 +2113,7 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+        let base = self.arker_dirty_base.clone();
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
@@ -2045,7 +2150,7 @@ impl RequestHandler for Vmm {
             // fallback would rot untested until the day it ran. `Vm::send` and
             // `MemoryManager::send` still exist to satisfy `Transportable`, but
             // nothing on the snapshot path calls them any more.
-            arker_vm_snapshot_live(vm, destination_url)
+            arker_vm_snapshot_live(vm, destination_url, base.as_deref())
         } else {
             Err(VmError::VmNotRunning)
         }
@@ -2111,9 +2216,21 @@ impl RequestHandler for Vmm {
                     if let Err(e) = vm.start_dirty_log() {
                         warn!("arker: could not arm the dirty log at restore: {e}");
                     } else {
+                        // This arming IS the epoch every later dirty read is
+                        // relative to, so the image we restored FROM is the one
+                        // base each capture writes a delta over. An unreadable
+                        // source URL is not a restore failure; it only means
+                        // dense captures.
+                        self.arker_dirty_base = crate::migration::url_to_path(source_url)
+                            .ok()
+                            .map(|dir| dir.join(crate::memory_manager::SNAPSHOT_FILENAME));
                         crate::memory_manager::arker_delta_report(&format!(
-                            "CHSINCE armed: pid={}",
-                            std::process::id()
+                            "CHSINCE armed: pid={} base={}",
+                            std::process::id(),
+                            self.arker_dirty_base
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "none".into())
                         ));
                     }
                 }

@@ -111,7 +111,7 @@ pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
-const SNAPSHOT_FILENAME: &str = "memory-ranges";
+pub(crate) const SNAPSHOT_FILENAME: &str = "memory-ranges";
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -3005,6 +3005,20 @@ impl MemoryManager {
     /// This is now the only way a snapshot's memory reaches disk --
     /// `MemoryManager::send` remains to satisfy `Transportable`, but nothing
     /// on the snapshot path calls it.
+    /// ARKER LIVE: how long a complete `memory-ranges` for this guest is.
+    ///
+    /// `memory_range_table(true)` for the same reason `arker_write_ranges` uses
+    /// it: the file is a bare concatenation of exactly the regions the RESTORE
+    /// side walks, so that table alone defines the image's length.
+    pub fn arker_image_len(&self) -> result::Result<u64, MigratableError> {
+        Ok(self
+            .memory_range_table(true)?
+            .regions()
+            .iter()
+            .map(|r| r.length)
+            .sum())
+    }
+
     pub fn arker_write_ranges(
         &self,
         destination_url: &str,
@@ -3536,6 +3550,170 @@ impl Snapshottable for MemoryManager {
 ///
 /// Read once, here, deliberately: two gates for one decision is how `ARKER_CH_DELTA`
 /// came to be true in `send()` and false in `vm_snapshot`.
+/// ARKER LIVE: the file arkerd drops in a capture destination to declare that it
+/// has ALREADY reflinked a full base image into `memory-ranges`, so pass 1 may
+/// write only what has changed instead of all 8 GiB.
+///
+/// Its contents are the absolute path of the base it cloned FROM, and that is the
+/// whole handshake. A handshake rather than a bare flag because a delta is
+/// correct only against the exact image it was accumulated against: CH knows that
+/// image (`Vmm::arker_dirty_base`), arkerd knows what it cloned, and writing a
+/// delta over the WRONG base yields a snapshot that restores into a
+/// plausible-looking guest with silently stale pages -- the same class of
+/// catastrophe as the zero-byte image, minus the triple fault that made that one
+/// obvious.
+pub(crate) const ARKER_BASE_MARKER: &str = ".arker-dirty-base";
+
+/// ARKER LIVE: does `destination` hold a complete reflinked copy of `expected_base`?
+///
+/// Every check here is a reason to fall back to the dense pre-copy and never a
+/// reason to fail: a dense capture is always correct, only slow. So this answers
+/// just "is the fast path provably safe", and anything unexpected -- no marker, a
+/// marker naming another base, a short image, an unreadable file -- is a no.
+///
+/// The length check catches an interrupted reflink. `ficlone` is atomic per call,
+/// but arkerd creates the file before cloning into it, and a crash in between
+/// would leave a 0-byte image that a delta pass would happily write 248 MiB into,
+/// producing exactly the sparse ruin `arker_cow_enabled`'s comment describes.
+pub(crate) fn arker_base_is_reflinked(
+    destination: &std::path::Path,
+    expected_base: Option<&std::path::Path>,
+    expected_len: u64,
+) -> bool {
+    let Some(expected_base) = expected_base else {
+        return false;
+    };
+    let Ok(declared) = std::fs::read_to_string(destination.join(ARKER_BASE_MARKER)) else {
+        return false;
+    };
+    // Spelling-tolerant. arkerd builds the marker from the same `vm_dir` it
+    // builds the restore URL from, so the literal strings normally match; a
+    // symlinked data dir or a trailing slash on either side must not silently
+    // demote every capture to dense, and that failure would look exactly like
+    // "the feature is off".
+    let declared_path = std::path::Path::new(declared.trim());
+    let same = declared_path == expected_base
+        || matches!(
+            (
+                std::fs::canonicalize(declared_path),
+                std::fs::canonicalize(expected_base),
+            ),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if !same {
+        arker_delta_report(&format!(
+            "CHCLONE reject: pid={} declared={} expected={}",
+            std::process::id(),
+            declared.trim(),
+            expected_base.display()
+        ));
+        return false;
+    }
+    match std::fs::metadata(destination.join(SNAPSHOT_FILENAME)) {
+        Ok(meta) if meta.len() == expected_len => true,
+        Ok(meta) => {
+            arker_delta_report(&format!(
+                "CHCLONE reject: pid={} image_len={} want={expected_len}",
+                std::process::id(),
+                meta.len()
+            ));
+            false
+        }
+        Err(e) => {
+            arker_delta_report(&format!(
+                "CHCLONE reject: pid={} image unreadable {e}",
+                std::process::id()
+            ));
+            false
+        }
+    }
+}
+
+/// ARKER LIVE: read a region's dirty bitmap WITHOUT clearing it.
+///
+/// `AtomicBitmap::get_and_reset` is the only BULK accessor vm-memory offers and
+/// it consumes, which is wrong for a fan-out of forks: every child needs the set
+/// since the same base, not since its predecessor. There is a non-destructive
+/// per-bit read, so this rebuilds the identical `Vec<u64>` the bulk call would
+/// have returned, bit by bit -- `get_and_reset` maps over one `AtomicU64` per 64
+/// pages, and `len()` is the bit count, so `size.div_ceil(64)` words match it
+/// exactly.
+///
+/// One atomic load per guest page: 2M of them for an 8 GiB guest, microseconds
+/// against a capture measured in hundreds of milliseconds. The KVM half of the
+/// same merge is made non-destructive by KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2
+/// instead, because there the kernel owns the bits and offers a real
+/// read-without-clear.
+fn arker_bitmap_snapshot(bitmap: &AtomicBitmap) -> Vec<u64> {
+    let bits = bitmap.len();
+    let mut words = vec![0u64; bits.div_ceil(64)];
+    for index in 0..bits {
+        if bitmap.is_bit_set(index) {
+            words[index / 64] |= 1u64 << (index % 64);
+        }
+    }
+    words
+}
+
+/// ARKER LIVE: the ranges in `newer` that `older` does not already cover.
+///
+/// What pass 2 has to write. Both reads are taken from the same pinned epoch and
+/// neither clears, so the post-pause read is a SUPERSET of the pre-copy read: the
+/// difference is exactly the pages the guest dirtied while pass 1 was copying.
+/// Writing `newer` whole instead would be correct but would re-write the entire
+/// delta with the vCPUs stopped, which is the downtime this path exists to avoid.
+///
+/// Inputs are coalesced first so the sweep can assume sorted, non-overlapping
+/// ranges; `MemoryRangeTable::push` is a bare `Vec::push` and the tables arrive
+/// as a concatenation of one sub-table per memory slot.
+pub(crate) fn arker_table_difference(
+    newer: &MemoryRangeTable,
+    older: &MemoryRangeTable,
+) -> MemoryRangeTable {
+    let newer = arker_coalesce(newer.regions().to_vec());
+    let older = arker_coalesce(older.regions().to_vec());
+    let mut out = MemoryRangeTable::default();
+    let mut cut = older.regions().iter().peekable();
+    for range in newer.regions() {
+        // Everything in `range` below `at` has been accounted for.
+        let mut at = range.gpa;
+        let end = range.gpa + range.length;
+        // Drop subtrahends that end before this range starts. Safe to consume
+        // across iterations because both sides are sorted.
+        while cut.peek().is_some_and(|c| c.gpa + c.length <= at) {
+            cut.next();
+        }
+        while at < end {
+            match cut.peek() {
+                // The next hole starts after this range ends: the rest is ours.
+                Some(c) if c.gpa >= end => break,
+                Some(c) => {
+                    if c.gpa > at {
+                        out.push(MemoryRange {
+                            gpa: at,
+                            length: c.gpa - at,
+                        });
+                    }
+                    at = (c.gpa + c.length).max(at);
+                    // Only advance past a subtrahend that cannot touch the NEXT
+                    // range too; one hole may span several.
+                    if c.gpa + c.length <= end {
+                        cut.next();
+                    }
+                }
+                None => break,
+            }
+        }
+        if at < end {
+            out.push(MemoryRange {
+                gpa: at,
+                length: end - at,
+            });
+        }
+    }
+    out
+}
+
 pub(crate) fn arker_dirty_since_restore_enabled() -> bool {
     std::env::var("ARKER_CH_DIRTY_SINCE_RESTORE").ok().as_deref() == Some("1")
 }
@@ -4524,7 +4702,14 @@ impl Migratable for MemoryManager {
                 Some(region) => {
                     assert!(region.start_addr().raw_value() == r.gpa);
                     assert!(region.len() == r.size);
-                    (**region).bitmap().get_and_reset()
+                    // Manual mode makes the KVM half non-destructive; this
+                    // half has to match or a second fork loses every DMA write
+                    // the first one consumed.
+                    if arker_dirty_since_restore_enabled() {
+                        arker_bitmap_snapshot((**region).bitmap())
+                    } else {
+                        (**region).bitmap().get_and_reset()
+                    }
                 }
                 None => {
                     return Err(MigratableError::MigrateSend(anyhow!(
@@ -4828,5 +5013,143 @@ mod unit_tests {
         assert!(restored[4096 * 5..4096 * 26].iter().all(|&b| b == 0));
         assert!(restored[4096 * 26..4096 * 30].iter().all(|&b| b == 0xBB));
         assert!(restored[4096 * 30..].iter().all(|&b| b == 0));
+    }
+}
+
+#[cfg(test)]
+mod arker_delta_tests {
+    use vm_memory::bitmap::AtomicBitmap;
+    use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
+
+    use super::{arker_bitmap_snapshot, arker_table_difference};
+
+    const PAGE: u64 = 4096;
+
+    fn table(ranges: &[(u64, u64)]) -> MemoryRangeTable {
+        let mut t = MemoryRangeTable::default();
+        for &(gpa, length) in ranges {
+            t.push(MemoryRange { gpa, length });
+        }
+        t
+    }
+
+    fn pages(t: &MemoryRangeTable) -> std::collections::BTreeSet<u64> {
+        let mut out = std::collections::BTreeSet::new();
+        for r in t.regions() {
+            assert_eq!(r.gpa % PAGE, 0, "unaligned gpa {}", r.gpa);
+            assert_eq!(r.length % PAGE, 0, "unaligned length {}", r.length);
+            for p in (r.gpa..r.gpa + r.length).step_by(PAGE as usize) {
+                out.insert(p);
+            }
+        }
+        out
+    }
+
+    /// The contract in one line: pass 2 writes newer MINUS older, exactly.
+    fn assert_difference_is_exact(newer: &[(u64, u64)], older: &[(u64, u64)]) {
+        let newer_t = table(newer);
+        let older_t = table(older);
+        let got = arker_table_difference(&newer_t, &older_t);
+        let want: std::collections::BTreeSet<u64> =
+            pages(&newer_t).difference(&pages(&older_t)).copied().collect();
+        assert_eq!(
+            pages(&got),
+            want,
+            "newer={newer:?} older={older:?} got={:?}",
+            got.regions()
+        );
+        // Ranges must be non-overlapping and ascending, or `arker_write_ranges`
+        // seeks backwards and writes some pages twice.
+        let mut last_end = 0u64;
+        for r in got.regions() {
+            assert!(
+                r.gpa >= last_end,
+                "overlapping/unsorted output {:?}",
+                got.regions()
+            );
+            assert!(r.length > 0, "empty range in output");
+            last_end = r.gpa + r.length;
+        }
+    }
+
+    #[test]
+    fn difference_handles_the_shapes_a_sweep_gets_wrong() {
+        // Disjoint: nothing subtracted.
+        assert_difference_is_exact(&[(0, 4 * PAGE)], &[(8 * PAGE, PAGE)]);
+        // Older fully covers newer: pass 2 writes nothing.
+        assert_difference_is_exact(&[(4 * PAGE, 2 * PAGE)], &[(0, 16 * PAGE)]);
+        // Older splits newer into two pieces -- the case that needs the
+        // post-loop tail push.
+        assert_difference_is_exact(&[(0, 8 * PAGE)], &[(3 * PAGE, 2 * PAGE)]);
+        // ONE older range spanning SEVERAL newer ranges: the subtrahend must not
+        // be consumed after the first, or the later ranges come through whole.
+        assert_difference_is_exact(
+            &[(0, PAGE), (4 * PAGE, PAGE), (8 * PAGE, PAGE)],
+            &[(0, 16 * PAGE)],
+        );
+        // Several older ranges inside ONE newer range: the inverse.
+        assert_difference_is_exact(&[(0, 16 * PAGE)], &[(2 * PAGE, PAGE), (6 * PAGE, PAGE)]);
+        // Exactly coincident, and touching-but-not-overlapping at both edges.
+        assert_difference_is_exact(&[(4 * PAGE, PAGE)], &[(4 * PAGE, PAGE)]);
+        assert_difference_is_exact(&[(4 * PAGE, PAGE)], &[(3 * PAGE, PAGE), (5 * PAGE, PAGE)]);
+        // Empty sides.
+        assert_difference_is_exact(&[], &[(0, PAGE)]);
+        assert_difference_is_exact(&[(0, PAGE)], &[]);
+        // UNSORTED and overlapping input, which is what actually arrives: a
+        // table is the concatenation of one sub-table per memory slot, and
+        // `push` is a bare `Vec::push`.
+        assert_difference_is_exact(
+            &[(8 * PAGE, 2 * PAGE), (0, 3 * PAGE), (2 * PAGE, 2 * PAGE)],
+            &[(9 * PAGE, PAGE), (1 * PAGE, PAGE)],
+        );
+    }
+
+    /// Randomised against the page-set oracle. A sweep over sorted ranges has
+    /// more edge cases than anyone enumerates by hand, and pass 2 writing one
+    /// page too few is a child with silently stale memory.
+    #[test]
+    fn difference_matches_a_brute_force_page_set() {
+        // Deterministic xorshift, so a failure is reproducible.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2_000 {
+            let mut mk = |count: u64| {
+                (0..(next() % count + 1))
+                    .map(|_| ((next() % 24) * PAGE, (next() % 5 + 1) * PAGE))
+                    .collect::<Vec<_>>()
+            };
+            let newer = mk(6);
+            let older = mk(6);
+            assert_difference_is_exact(&newer, &older);
+        }
+    }
+
+    /// The vm-memory half must report the same bits as the consuming call and
+    /// leave them set, or a second fork off one parent loses every DMA write the
+    /// first one read.
+    #[test]
+    fn bitmap_snapshot_reads_the_same_bits_without_clearing_them() {
+        let bitmap = AtomicBitmap::new(16 * PAGE as usize, (PAGE as usize).try_into().unwrap());
+        bitmap.set_addr_range(PAGE as usize, PAGE as usize);
+        bitmap.set_addr_range(9 * PAGE as usize, 2 * PAGE as usize);
+
+        let first = arker_bitmap_snapshot(&bitmap);
+        let second = arker_bitmap_snapshot(&bitmap);
+        assert_eq!(first, second, "snapshot must be repeatable");
+        assert!(first.iter().any(|w| *w != 0), "nothing was recorded at all");
+
+        // Identical to what the consuming accessor reports -- and taken LAST,
+        // because it is the one that clears.
+        let consumed = bitmap.get_and_reset();
+        assert_eq!(first, consumed, "snapshot disagrees with get_and_reset");
+        assert!(
+            arker_bitmap_snapshot(&bitmap).iter().all(|w| *w == 0),
+            "control: get_and_reset should have cleared the bits"
+        );
     }
 }

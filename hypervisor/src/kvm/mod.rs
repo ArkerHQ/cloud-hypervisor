@@ -1614,6 +1614,54 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 }
             }
 
+            // ARKER LIVE: make reading the dirty log NON-DESTRUCTIVE.
+            //
+            // By default KVM_GET_DIRTY_LOG clears every bit it reports. That is
+            // right for live migration and wrong for a fan-out of forks off one
+            // parent: the second child would see only what changed since the
+            // first and write that delta over an image predating it, producing a
+            // guest whose memory is silently stale in exactly the pages the first
+            // child was given.
+            //
+            // KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 splits the two halves -- the read
+            // reports without clearing, and the caller clears explicitly with
+            // KVM_CLEAR_DIRTY_LOG. That is what lets every capture read "changed
+            // since the base" from one pinned epoch, with no accumulator to keep
+            // and nothing to invalidate when a capture fails half-written.
+            //
+            // MEASURED available on the fleet: cap 168 reports 3 on
+            // 7.0.0-1013-aws (bit 0 manual-protect, bit 1 initially-set), against
+            // a clean control (cap 8 -> 1, a bogus cap -> 0).
+            //
+            // ONLY bit 0 is asked for. KVM_DIRTY_LOG_INITIALLY_SET would mark
+            // every page dirty at slot creation, which is the exact opposite of
+            // the question the log is being asked.
+            //
+            // Gated, because enabling it changes what EVERY `dirty_log()` in the
+            // process means: upstream's `do_memory_iterations` relies on the read
+            // consuming the set, and without that it would re-send the whole
+            // guest on every pre-copy iteration and never converge.
+            if arker_manual_dirty_log_enabled() {
+                let cap = kvm_bindings::kvm_enable_cap {
+                    cap: kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+                    args: [
+                        kvm_bindings::KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                    ..Default::default()
+                };
+                // Best-effort, like the nested caps above: on a host without the
+                // cap the read keeps clearing, which the capture path detects as
+                // "no usable base" and answers with a dense dump.
+                if let Err(e) = fd.enable_cap(&cap) {
+                    warn!("ARKER: manual dirty log cap enable failed (non-fatal): {e:?}");
+                } else {
+                    eprintln!("CHMANUAL dirty-log manual-protect enabled");
+                }
+            }
+
             let msr_list = self.get_msr_list()?;
             let num_msrs = msr_list.as_fam_struct_ref().nmsrs as usize;
             let mut msrs = vec![
@@ -3720,4 +3768,17 @@ mod unit_tests {
         vcpu0.set_regs(&core_regs).unwrap();
         assert_eq!(vcpu0.get_regs().unwrap(), core_regs);
     }
+}
+
+/// ARKER LIVE: whether to put KVM's dirty log in manual-clear mode.
+///
+/// Reads the SAME variable as `vmm::memory_manager::arker_dirty_since_restore_enabled`,
+/// and that duplication is forced rather than chosen: `hypervisor` is below `vmm`
+/// in the crate graph, so it cannot call the one reader. The two must agree --
+/// non-destructive reads in `dirty_log()` are only correct if the kernel was
+/// actually put in manual mode, and manual mode without the matching reader would
+/// leak dirty bits forever. Both are keyed off one variable so there is no way to
+/// set half of it.
+fn arker_manual_dirty_log_enabled() -> bool {
+    std::env::var("ARKER_CH_DIRTY_SINCE_RESTORE").ok().as_deref() == Some("1")
 }

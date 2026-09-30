@@ -3062,6 +3062,12 @@ impl Vm {
         Ok(())
     }
 
+    /// ARKER LIVE: the length of a complete memory image for this guest, so the
+    /// caller can tell a finished reflink from an interrupted one.
+    pub fn arker_image_len(&self) -> std::result::Result<u64, MigratableError> {
+        self.memory_manager.lock().unwrap().arker_image_len()
+    }
+
     /// ARKER LIVE: pre-copy every guest region into the destination's memory
     /// file while the vCPUs are still RUNNING.
     ///
