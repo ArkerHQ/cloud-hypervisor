@@ -3517,6 +3517,29 @@ impl Snapshottable for MemoryManager {
 /// all-zero RAM, triple-faulted on both vCPUs and cold-booted, losing every
 /// byte of parent state. Under COW the ONLY authoritative source is the guest
 /// VA, so force the dense `write_volatile_to` path that reads it.
+/// `ARKER_CH_DIRTY_SINCE_RESTORE` — opt-in, so ONLY "1" enables, like
+/// `arker_cow_enabled` and for the same reason: this changes what the VMM does for
+/// a VM's whole life, so it must not turn itself on.
+///
+/// Arms the dirty log at RESTORE rather than at capture, so the set spans
+/// restore->capture instead of just the pre-copy window. INSTRUMENT-ONLY today: the
+/// capture still writes the dense pre-copy, and `arker_vm_snapshot_live` merely
+/// REPORTS what the accumulated set would have been. It exists to measure two things
+/// before anything skips a byte:
+///
+///   1. how much of the 8.59 GB dense pre-copy is actually avoidable, which
+///      measurement says depends on parent uptime (0.19 GiB dirty at t=10s, 3.53 GiB
+///      by ~100s on an 8 GiB Windows guest);
+///   2. what arming KVM dirty logging for a VM's whole life COSTS the guest, which
+///      is unmeasured and is the reason this is opt-in. KVM write-protects pages to
+///      track them, so the first write to each page faults.
+///
+/// Read once, here, deliberately: two gates for one decision is how `ARKER_CH_DELTA`
+/// came to be true in `send()` and false in `vm_snapshot`.
+pub(crate) fn arker_dirty_since_restore_enabled() -> bool {
+    std::env::var("ARKER_CH_DIRTY_SINCE_RESTORE").ok().as_deref() == Some("1")
+}
+
 fn arker_cow_enabled() -> bool {
     cow_enabled(std::env::var("ARKER_CH_COW").ok().as_deref())
 }

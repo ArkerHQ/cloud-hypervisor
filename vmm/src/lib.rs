@@ -1812,6 +1812,29 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
 /// fails has already cost the caller its snapshot; leaving the guest paused
 /// on the way out would cost it the VM as well.
 fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<(), VmError> {
+    // If the log was armed at RESTORE, this is the set that accumulated since then:
+    // what a since-restore pre-copy could write instead of the whole region. REPORTED
+    // ONLY -- the capture below is unchanged, so this cannot corrupt a snapshot.
+    //
+    // It must sit before `start_dirty_log`, and reading it is not destructive in any
+    // way that matters: `dirty_log()` CONSUMES the set, and the next line resets the
+    // bitmaps regardless.
+    if crate::memory_manager::arker_dirty_since_restore_enabled() {
+        match vm.dirty_log() {
+            Ok(table) => {
+                let bytes: u64 = table.regions().iter().map(|r| r.length).sum();
+                crate::memory_manager::arker_delta_report(&format!(
+                    "CHSINCE restore: pid={} extents={} bytes={bytes}",
+                    std::process::id(),
+                    table.regions().len()
+                ));
+            }
+            Err(e) => crate::memory_manager::arker_delta_report(&format!(
+                "CHSINCE restore: pid={} FAILED {e}",
+                std::process::id()
+            )),
+        }
+    }
     vm.start_dirty_log().map_err(VmError::Snapshot)?;
     if let Err(e) = vm.arker_precopy_memory(destination_url) {
         let _ = vm.stop_dirty_log();
@@ -2070,6 +2093,31 @@ impl RequestHandler for Vmm {
             restore_cfg.memory_restore_mode,
         )
         .and_then(|()| {
+            // Arm the dirty log HERE, not at capture, when asked. `start_dirty_log`
+            // resets the vm-memory region bitmaps, so arming at capture means the
+            // set only ever covers the pre-copy window; arming at restore makes it
+            // span restore->capture, which is the set a pre-copy could write instead
+            // of the whole region. Opt-in, because it taxes the guest for its whole
+            // life -- see `arker_dirty_since_restore_enabled`.
+            //
+            // Before the resume deliberately: everything the guest dirties settling
+            // after resume is exactly what we are trying to measure, and arming
+            // after would miss it.
+            //
+            // Best-effort: failing to arm costs a measurement, and must not cost the
+            // caller its restore.
+            if crate::memory_manager::arker_dirty_since_restore_enabled() {
+                if let Some(ref mut vm) = self.vm {
+                    if let Err(e) = vm.start_dirty_log() {
+                        warn!("arker: could not arm the dirty log at restore: {e}");
+                    } else {
+                        crate::memory_manager::arker_delta_report(&format!(
+                            "CHSINCE armed: pid={}",
+                            std::process::id()
+                        ));
+                    }
+                }
+            }
             if restore_cfg.resume {
                 self.vm_resume()
             } else {
