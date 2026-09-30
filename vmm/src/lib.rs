@@ -2033,10 +2033,24 @@ fn arker_vm_snapshot_live(
         // the vCPUs stopped -- the downtime this path exists to avoid.
         let pending = match before.as_ref() {
             Some(before) => crate::memory_manager::arker_table_difference(&now, before),
-            None => now,
+            None => now.clone(),
         };
         vm.arker_write_dirty_memory(destination_url, &pending)
             .map_err(VmError::SnapshotSend)?;
+        // The image is now complete and the guest is PAUSED, which is the only
+        // moment its memory is stable enough to check against. `now` is the
+        // union of what both passes wrote, so every page OUTSIDE it is one the
+        // delta path claims the base already had -- exactly the assumption the
+        // whole approach rests on and the one nothing was testing.
+        //
+        // Its own variable, and off by default: this reads the entire image.
+        if dirty_only && std::env::var("ARKER_CH_DELTA_VERIFY").ok().as_deref() == Some("1") {
+            if let Err(e) = vm.arker_verify_delta(destination_url, &now) {
+                crate::memory_manager::arker_delta_report(&format!(
+                    "CHVERIFY: pid={pid} FAILED {e}"
+                ));
+            }
+        }
         let snapshot = vm.snapshot().map_err(VmError::Snapshot)?;
         vm.arker_send_state_only(&snapshot, destination_url)
             .map_err(VmError::SnapshotSend)

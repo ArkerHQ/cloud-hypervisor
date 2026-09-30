@@ -953,7 +953,7 @@ impl MemoryManager {
                         return Err(Error::SnapshotRead(io::Error::new(
                             io::ErrorKind::Other,
                             "fill_saved_regions worker panicked",
-                        )))
+                        )));
                     }
                 }
             }
@@ -990,8 +990,10 @@ impl MemoryManager {
             Some(Err(missing)) => {
                 return Err(Error::SnapshotOpen(std::io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("overlay image {} needs base {missing}, which is absent",
-                            file_path.display()),
+                    format!(
+                        "overlay image {} needs base {missing}, which is absent",
+                        file_path.display()
+                    ),
                 )));
             }
             None => (file_path.to_path_buf(), None),
@@ -1052,19 +1054,21 @@ impl MemoryManager {
         std::thread::scope(|scope| {
             for _ in 0..nthreads {
                 let cursor_ref = &cursor;
-                scope.spawn(move || loop {
-                    let i = cursor_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= units_ref.len() {
-                        break;
-                    }
-                    let (addr, len) = units_ref[i];
-                    // SAFETY: addr/len lie within our just-established mappings.
-                    unsafe {
-                        libc::madvise(
-                            addr as *mut libc::c_void,
-                            len as usize,
-                            MADV_POPULATE_READ,
-                        );
+                scope.spawn(move || {
+                    loop {
+                        let i = cursor_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= units_ref.len() {
+                            break;
+                        }
+                        let (addr, len) = units_ref[i];
+                        // SAFETY: addr/len lie within our just-established mappings.
+                        unsafe {
+                            libc::madvise(
+                                addr as *mut libc::c_void,
+                                len as usize,
+                                MADV_POPULATE_READ,
+                            );
+                        }
                     }
                 });
             }
@@ -1125,14 +1129,12 @@ impl MemoryManager {
         // holding a half-updated image -- silent memory corruption, and exactly the
         // failure mode the holes-mean-unchanged design exists to avoid. A
         // filesystem without SEEK_HOLE must fail the restore loudly instead.
-        while let Some((d, extent_len)) = next_data_extent(ovf.as_fd(), off, end)
-            .map_err(|e| {
-                Error::SnapshotRead(io::Error::other(format!(
-                    "overlay {} extent walk failed at {off}: {e}",
-                    overlay.display()
-                )))
-            })?
-        {
+        while let Some((d, extent_len)) = next_data_extent(ovf.as_fd(), off, end).map_err(|e| {
+            Error::SnapshotRead(io::Error::other(format!(
+                "overlay {} extent walk failed at {off}: {e}",
+                overlay.display()
+            )))
+        })? {
             let h = d + extent_len;
             // Map the dense file offset back to a GPA through the same range
             // table the writer used, so an overlay can only be applied to the
@@ -1151,7 +1153,8 @@ impl MemoryManager {
                 let len = (e - s) as usize;
                 let mut buf = vec![0u8; len];
                 use std::os::unix::fs::FileExt as _;
-                ovf.read_exact_at(&mut buf, s).map_err(Error::SnapshotRead)?;
+                ovf.read_exact_at(&mut buf, s)
+                    .map_err(Error::SnapshotRead)?;
                 guest_memory
                     .write_slice(&buf, GuestAddress(gpa))
                     .map_err(|_| {
@@ -3005,6 +3008,74 @@ impl MemoryManager {
     /// This is now the only way a snapshot's memory reaches disk --
     /// `MemoryManager::send` remains to satisfy `Transportable`, but nothing
     /// on the snapshot path calls it.
+    /// ARKER LIVE: does the delta path's ONE assumption actually hold?
+    ///
+    /// A delta capture writes only the dirty set over a reflinked base, which is
+    /// correct if and only if every page NOT in that set is already identical in
+    /// the base. That is the whole premise, it was never checked, and a 6/6
+    /// fork-integrity failure says something about it is false.
+    ///
+    /// So check it directly, page by page, and report WHERE it breaks rather
+    /// than reasoning about which of several candidate mechanisms it might be.
+    /// This reads the whole image and is strictly a diagnostic — gated by its
+    /// own variable, never on by default.
+    ///
+    /// Returns `(clean_pages, mismatched_pages)` and reports the first few
+    /// offending guest addresses, because the PATTERN is the diagnosis: a
+    /// handful of scattered pages reads as a dirty-log gap, a contiguous run at
+    /// a region boundary reads as a layout/offset mismatch, and everything
+    /// mismatching reads as the wrong base entirely.
+    pub fn arker_verify_delta(
+        &self,
+        destination_url: &str,
+        dirty: &MemoryRangeTable,
+    ) -> result::Result<(u64, u64), MigratableError> {
+        use std::io::Read;
+        let layout = self.memory_range_table(true)?;
+        let mut path = url_to_path(destination_url)?;
+        path.push(String::from(SNAPSHOT_FILENAME));
+        let mut file = File::open(&path).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        let guest_memory = self.guest_memory.memory();
+        let (mut clean, mut bad) = (0u64, 0u64);
+        let mut examples: Vec<String> = Vec::new();
+        let mut file_cursor: u64 = 0;
+        const PAGE_SIZE: u64 = arch::PAGE_SIZE as u64;
+        let mut from_base = vec![0u8; PAGE_SIZE as usize];
+        let mut from_guest = vec![0u8; PAGE_SIZE as usize];
+        for region in layout.regions() {
+            let mut offset = 0u64;
+            while offset + PAGE_SIZE <= region.length {
+                let gpa = region.gpa + offset;
+                // Only the pages the delta pass DID NOT write are under test.
+                if arker_dirty_overlaps(dirty, gpa, PAGE_SIZE).is_empty() {
+                    file.seek(SeekFrom::Start(file_cursor + offset))
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    file.read_exact(&mut from_base)
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    guest_memory
+                        .read_slice(&mut from_guest, GuestAddress(gpa))
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    if from_base == from_guest {
+                        clean += 1;
+                    } else {
+                        bad += 1;
+                        if examples.len() < 8 {
+                            examples.push(format!("{gpa:#x}@{}", file_cursor + offset));
+                        }
+                    }
+                }
+                offset += PAGE_SIZE;
+            }
+            file_cursor += region.length;
+        }
+        arker_delta_report(&format!(
+            "CHVERIFY: pid={} clean={clean} MISMATCHED={bad} first=[{}]",
+            std::process::id(),
+            examples.join(" ")
+        ));
+        Ok((clean, bad))
+    }
+
     /// ARKER LIVE: how long a complete `memory-ranges` for this guest is.
     ///
     /// `memory_range_table(true)` for the same reason `arker_write_ranges` uses
@@ -3739,7 +3810,10 @@ pub(crate) fn arker_table_difference(
 }
 
 pub(crate) fn arker_dirty_since_restore_enabled() -> bool {
-    std::env::var("ARKER_CH_DIRTY_SINCE_RESTORE").ok().as_deref() == Some("1")
+    std::env::var("ARKER_CH_DIRTY_SINCE_RESTORE")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 fn arker_cow_enabled() -> bool {
@@ -4270,8 +4344,8 @@ impl Transportable for MemoryManager {
                 // A base with no sidecar is accepted on LAYOUT (goldens predate
                 // this and would otherwise be refused for ever), but never on
                 // fragmentation -- that is measured directly.
-                let layout_ok = got.is_empty()
-                    || got.strip_prefix(ARKER_DENSE_MARK).unwrap_or(&got) == want;
+                let layout_ok =
+                    got.is_empty() || got.strip_prefix(ARKER_DENSE_MARK).unwrap_or(&got) == want;
                 // Bracket the FIEMAP call. The previous run logged 'decide' and
                 // then neither of this branch's two exhaustive reports, so the
                 // stall is between them -- these two lines say whether it is the
@@ -4363,9 +4437,7 @@ impl Transportable for MemoryManager {
                 for (dgpa, dlen) in overlaps {
                     let at = file_cursor + (dgpa - range.gpa);
                     if let Err(e) = memory_file.seek(SeekFrom::Start(at)) {
-                        arker_delta_report(&format!(
-                            "CHDELTA write: seek to {at} failed: {e}"
-                        ));
+                        arker_delta_report(&format!("CHDELTA write: seek to {at} failed: {e}"));
                         return Err(MigratableError::MigrateSend(e.into()));
                     }
                     let mut off: u64 = 0;
@@ -4486,13 +4558,20 @@ impl Transportable for MemoryManager {
             let t_v = std::time::Instant::now();
             let ref_path = memory_file_path.with_extension("fullref");
             match OpenOptions::new()
-                .read(true).write(true).create(true).truncate(true).open(&ref_path)
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&ref_path)
             {
                 Ok(mut rf) => {
                     let mut cur: u64 = 0;
                     let mut ok = true;
                     for range in self.snapshot_memory_ranges.regions() {
-                        if rf.seek(SeekFrom::Start(cur)).is_err() { ok = false; break; }
+                        if rf.seek(SeekFrom::Start(cur)).is_err() {
+                            ok = false;
+                            break;
+                        }
                         let mut off: u64 = 0;
                         while off < range.length {
                             match guest_memory.write_volatile_to(
@@ -4501,10 +4580,15 @@ impl Transportable for MemoryManager {
                                 (range.length - off) as usize,
                             ) {
                                 Ok(n) if n > 0 => off += n as u64,
-                                _ => { ok = false; break; }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
-                        if !ok { break; }
+                        if !ok {
+                            break;
+                        }
                         cur += range.length;
                     }
                     if ok {
@@ -4578,7 +4662,9 @@ impl Transportable for MemoryManager {
                                 compared += 1;
                                 if a != b {
                                     differ += 1;
-                                    if first.len() < 16 { first.push(off); }
+                                    if first.len() < 16 {
+                                        first.push(off);
+                                    }
                                 }
                             }
                             off += PAGE as u64;
@@ -4641,7 +4727,10 @@ impl Transportable for MemoryManager {
                 total_len / 1048576,
                 arker_extents,
                 arker_t0.elapsed().as_secs_f64() * 1000.0,
-                arker_base.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                arker_base
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             ));
         }
         // Same deferred close for the fd we wrote through: on the delta path this
@@ -5074,8 +5163,10 @@ mod arker_delta_tests {
         let newer_t = table(newer);
         let older_t = table(older);
         let got = arker_table_difference(&newer_t, &older_t);
-        let want: std::collections::BTreeSet<u64> =
-            pages(&newer_t).difference(&pages(&older_t)).copied().collect();
+        let want: std::collections::BTreeSet<u64> = pages(&newer_t)
+            .difference(&pages(&older_t))
+            .copied()
+            .collect();
         assert_eq!(
             pages(&got),
             want,

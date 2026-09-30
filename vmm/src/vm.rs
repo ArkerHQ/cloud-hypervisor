@@ -3062,6 +3062,18 @@ impl Vm {
         Ok(())
     }
 
+    /// ARKER LIVE: check the delta path's premise page by page. Diagnostic only.
+    pub fn arker_verify_delta(
+        &self,
+        destination_url: &str,
+        dirty: &MemoryRangeTable,
+    ) -> std::result::Result<(u64, u64), MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .arker_verify_delta(destination_url, dirty)
+    }
+
     /// ARKER LIVE: the length of a complete memory image for this guest, so the
     /// caller can tell a finished reflink from an interrupted one.
     pub fn arker_image_len(&self) -> std::result::Result<u64, MigratableError> {
