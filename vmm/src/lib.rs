@@ -643,6 +643,20 @@ pub struct Vmm {
     console_resize_pipe: Option<Arc<File>>,
     console_info: Option<ConsoleInfo>,
     no_shutdown: bool,
+    /// ARKER LIVE: whether this VM's dirty log was armed at restore and has
+    /// been left armed since.
+    ///
+    /// NOT the same question as "is the feature enabled", and conflating the two
+    /// broke the golden bake. A cold-booted VM never goes through `vm_restore`,
+    /// so nothing arms its log; a capture that read the flag and concluded "the
+    /// log is already armed, do not arm it" then asked an unarmed log for its
+    /// dirty set, and KVM answers that with an error, not an empty set. The
+    /// post-pause read propagates it and the capture fails — which is every
+    /// `create_from_image` bake on an env with the flag on.
+    ///
+    /// So the arm/stop decision keys off THIS, and a VM whose log was never
+    /// armed takes exactly the path it took before any of this existed.
+    arker_dirty_armed: bool,
     /// ARKER LIVE: the memory image every capture of this VM writes its delta
     /// over, or `None` when captures must be dense.
     ///
@@ -858,6 +872,7 @@ impl Vmm {
             console_resize_pipe: None,
             console_info: None,
             no_shutdown,
+            arker_dirty_armed: false,
             arker_dirty_base: None,
         })
     }
@@ -1860,13 +1875,20 @@ fn arker_vm_snapshot_live(
     vm: &mut Vm,
     destination_url: &str,
     dirty_base: Option<&std::path::Path>,
+    armed: bool,
 ) -> result::Result<(), VmError> {
     let pid = std::process::id();
 
-    // Whether this process put KVM's dirty log in manual-clear mode at VM
-    // creation. The same variable gates both, precisely so a non-destructive
-    // reader can never run against a log that still clears itself.
-    let manual = crate::memory_manager::arker_dirty_since_restore_enabled();
+    // Whether the log is already armed and must therefore be left alone.
+    //
+    // This was the FLAG, which is a different question and a wrong answer for a
+    // cold-booted VM: nothing arms its log, so skipping the arming here left the
+    // reads below asking KVM about a log it is not keeping, which errors rather
+    // than returning an empty set, and failed every golden bake on an env with
+    // the flag on. `armed` is set only where `start_dirty_log` actually
+    // succeeded at restore, so a bake now takes the same arm/dense/stop path it
+    // always took.
+    let manual = armed;
 
     // Arming is upstream's behaviour and belongs only to it. In manual mode the
     // log was armed once at restore -- that arming IS the epoch both reads below
@@ -2114,6 +2136,7 @@ impl RequestHandler for Vmm {
 
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         let base = self.arker_dirty_base.clone();
+        let armed = self.arker_dirty_armed;
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
@@ -2150,7 +2173,7 @@ impl RequestHandler for Vmm {
             // fallback would rot untested until the day it ran. `Vm::send` and
             // `MemoryManager::send` still exist to satisfy `Transportable`, but
             // nothing on the snapshot path calls them any more.
-            arker_vm_snapshot_live(vm, destination_url, base.as_deref())
+            arker_vm_snapshot_live(vm, destination_url, base.as_deref(), armed)
         } else {
             Err(VmError::VmNotRunning)
         }
@@ -2216,6 +2239,7 @@ impl RequestHandler for Vmm {
                     if let Err(e) = vm.start_dirty_log() {
                         warn!("arker: could not arm the dirty log at restore: {e}");
                     } else {
+                        self.arker_dirty_armed = true;
                         // This arming IS the epoch every later dirty read is
                         // relative to, so the image we restored FROM is the one
                         // base each capture writes a delta over. An unreadable
