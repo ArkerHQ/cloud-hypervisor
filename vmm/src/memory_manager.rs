@@ -3610,7 +3610,31 @@ pub(crate) fn arker_base_is_reflinked(
         return false;
     }
     match std::fs::metadata(destination.join(SNAPSHOT_FILENAME)) {
-        Ok(meta) if meta.len() == expected_len => true,
+        // LENGTH AND ALLOCATION. `len()` alone is the APPARENT size, which a
+        // sparse file satisfies with nothing allocated at all -- `set_len` on an
+        // empty file produces exactly that. Accepting one would let the delta
+        // pass write its 248 MiB into holes and call the result an image, which
+        // is the zero-byte catastrophe `arker_cow_enabled` documents, reached
+        // from the other side.
+        //
+        // A reflinked base SHARES the base's blocks, so it reports the base's
+        // allocation: fill is ~100%, not ~0%. Half is a generous floor that
+        // still rejects an unwritten or punched file outright. Mirrors FC's
+        // `mem_artifact_stat`, which reports exactly this ratio as `fill_pct`
+        // for the same reason.
+        Ok(meta) if meta.len() == expected_len => {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = meta.blocks().saturating_mul(512);
+            if allocated * 2 >= expected_len {
+                return true;
+            }
+            arker_delta_report(&format!(
+                "CHCLONE reject: pid={} image is SPARSE allocated={} apparent={expected_len}",
+                std::process::id(),
+                allocated
+            ));
+            false
+        }
         Ok(meta) => {
             arker_delta_report(&format!(
                 "CHCLONE reject: pid={} image_len={} want={expected_len}",

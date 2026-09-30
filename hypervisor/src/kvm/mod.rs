@@ -1655,10 +1655,20 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 // Best-effort, like the nested caps above: on a host without the
                 // cap the read keeps clearing, which the capture path detects as
                 // "no usable base" and answers with a dense dump.
-                if let Err(e) = fd.enable_cap(&cap) {
-                    warn!("ARKER: manual dirty log cap enable failed (non-fatal): {e:?}");
-                } else {
-                    eprintln!("CHMANUAL dirty-log manual-protect enabled");
+                match fd.enable_cap(&cap) {
+                    Err(e) => {
+                        // Recorded, not just logged. The capture path's
+                        // correctness depends on reads being non-consuming, so
+                        // "did this take" has to be a fact it can READ, not an
+                        // assumption it rests on. It was an `eprintln!` before,
+                        // which lands in the VM's own stderr log and dies with
+                        // the VM -- one line in 90 minutes of journal across
+                        // many VMs, which is not a measurement. Cost: a 6/6
+                        // integrity failure whose cause could only be guessed.
+                        warn!("ARKER: manual dirty log cap enable failed (non-fatal): {e:?}");
+                        ARKER_MANUAL_DIRTY_LOG.store(false, Ordering::SeqCst);
+                    }
+                    Ok(()) => ARKER_MANUAL_DIRTY_LOG.store(true, Ordering::SeqCst),
                 }
             }
 
@@ -3768,6 +3778,20 @@ mod unit_tests {
         vcpu0.set_regs(&core_regs).unwrap();
         assert_eq!(vcpu0.get_regs().unwrap(), core_regs);
     }
+}
+
+/// ARKER LIVE: did `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` actually take on this
+/// process's VM?
+///
+/// Starts false and is only ever set by the enable below, so "we asked for it"
+/// and "we have it" cannot be confused. A reader that treats a non-consuming
+/// dirty log as given when the cap silently failed writes a delta that is
+/// missing everything the previous read consumed.
+static ARKER_MANUAL_DIRTY_LOG: AtomicBool = AtomicBool::new(false);
+
+/// ARKER LIVE: is this process's dirty log non-consuming?
+pub fn arker_manual_dirty_log_active() -> bool {
+    ARKER_MANUAL_DIRTY_LOG.load(Ordering::SeqCst)
 }
 
 /// ARKER LIVE: whether to put KVM's dirty log in manual-clear mode.

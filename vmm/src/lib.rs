@@ -1834,6 +1834,29 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
 /// Resume is best-effort on the failure paths deliberately. A capture that
 /// fails has already cost the caller its snapshot; leaving the guest paused
 /// on the way out would cost it the VM as well.
+/// ARKER LIVE: is this process's KVM dirty log NON-CONSUMING?
+///
+/// The delta capture is correct only if `KVM_GET_DIRTY_LOG` reports without
+/// clearing, which is what `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` buys. That enable
+/// is best-effort — a host without the cap must still boot — so "we asked for
+/// it" and "we have it" are DIFFERENT FACTS, and the fast path needs the second.
+///
+/// Assuming it cost a 6/6 fork-integrity failure. With consuming reads, capture
+/// 1 is correct and capture 2 is missing everything capture 1 read: the FIRST
+/// fork off a parent looks fine and every one after it restores a guest that
+/// cannot resume. Checking is one atomic load; not checking is silent corruption
+/// that only shows up on the second fork.
+fn arker_non_consuming_dirty_log() -> bool {
+    #[cfg(feature = "kvm")]
+    {
+        hypervisor::kvm::arker_manual_dirty_log_active()
+    }
+    #[cfg(not(feature = "kvm"))]
+    {
+        false
+    }
+}
+
 /// ARKER LIVE: capture `vm` into `destination_url` without stopping the guest for
 /// the whole image.
 ///
@@ -1889,6 +1912,19 @@ fn arker_vm_snapshot_live(
     // succeeded at restore, so a bake now takes the same arm/dense/stop path it
     // always took.
     let manual = armed;
+    // The OTHER precondition, and the one that was assumed. A reflinked base
+    // with a CONSUMING dirty log is the corrupting combination: the unchanged
+    // bytes are present, but the set naming which of them to rewrite is short by
+    // everything the previous read took. Reported through `arker_delta_report`
+    // rather than `eprintln!`, because the latter dies with the VM and is why
+    // this could only be guessed at the first time.
+    let non_consuming = arker_non_consuming_dirty_log();
+    if manual && !non_consuming {
+        crate::memory_manager::arker_delta_report(&format!(
+            "CHCLONE reject: pid={pid} dirty log CONSUMES \
+             (KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 not active) — dense capture"
+        ));
+    }
 
     // Arming is upstream's behaviour and belongs only to it. In manual mode the
     // log was armed once at restore -- that arming IS the epoch both reads below
@@ -1928,7 +1964,9 @@ fn arker_vm_snapshot_live(
         let image_len = vm.arker_image_len().map_err(VmError::SnapshotSend)?;
         let destination =
             crate::migration::url_to_path(destination_url).map_err(VmError::SnapshotSend)?;
-        if crate::memory_manager::arker_base_is_reflinked(&destination, dirty_base, image_len) {
+        if non_consuming
+            && crate::memory_manager::arker_base_is_reflinked(&destination, dirty_base, image_len)
+        {
             let bytes: u64 = before.regions().iter().map(|r| r.length).sum();
             // Wall clock, not correctness: a scattered write costs a seek per
             // extent, and overrunning arkerd's snapshot timeout reaps the VM
