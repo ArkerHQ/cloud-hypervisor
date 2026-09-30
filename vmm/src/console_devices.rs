@@ -106,6 +106,12 @@ fn modify_mode<F: FnOnce(&mut termios)>(
     Ok(())
 }
 
+// O_APPEND lets the host truncate a console file in place while the VM
+// keeps writing to it.
+fn open_append(path: &std::path::Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 fn set_raw_mode(
     f: &dyn AsRawFd,
     original_termios_opt: &mut Option<termios>,
@@ -183,7 +189,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     let console_info = ConsoleInfo {
         console: match vmconfig.console.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.console.common.file.as_ref().unwrap())
+                let file = open_append(vmconfig.console.common.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -232,7 +238,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         },
         serial: match vmconfig.serial.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.common.file.as_ref().unwrap())
+                let file = open_append(vmconfig.serial.common.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -270,7 +276,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         #[cfg(target_arch = "x86_64")]
         debug: match vmconfig.debug_console.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.debug_console.file.as_ref().unwrap())
+                let file = open_append(vmconfig.debug_console.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
