@@ -183,7 +183,10 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     let console_info = ConsoleInfo {
         console: match vmconfig.console.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.console.common.file.as_ref().unwrap())
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(vmconfig.console.common.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -273,7 +276,10 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         #[cfg(target_arch = "x86_64")]
         debug: match vmconfig.debug_console.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.debug_console.file.as_ref().unwrap())
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(vmconfig.debug_console.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
