@@ -1911,6 +1911,64 @@ fn arker_vm_snapshot_live(
     // the flag on. `armed` is set only where `start_dirty_log` actually
     // succeeded at restore, so a bake now takes the same arm/dense/stop path it
     // always took.
+    // ── COW capture ─────────────────────────────────────────────────────────
+    // A reflinked base plus the pages the guest has PRIVATELY modified is the
+    // whole image, and the page tables already know which those are
+    // (`arker_private_pages`). So this path needs no dirty log, which means no
+    // arming, which means none of the write-protect tax that made forked
+    // Windows children take 110s to answer.
+    //
+    // ONE pass, under ONE pause, because the COW set is monotonic but NOT
+    // incremental: a page that was already private and is written again is
+    // still just "private", so it cannot feed a second pass. It does not need
+    // to — the fork path pauses its source before snapshotting it (see the
+    // pause comment below), so this capture arrives at a stopped guest anyway
+    // and a live pre-copy would overlap with nothing.
+    //
+    // Downtime is therefore the delta write itself: ~533 MB measured, ~0.2s,
+    // against the 2.9s a dense sweep costs. The dense path below keeps its
+    // live two-pass unchanged, so a SUSPEND of a running VM is unaffected.
+    if let Some(base) = dirty_base {
+        let destination =
+            crate::migration::url_to_path(destination_url).map_err(VmError::SnapshotSend)?;
+        let image_len = vm.arker_image_len().map_err(VmError::SnapshotSend)?;
+        if crate::memory_manager::arker_base_is_reflinked(&destination, Some(base), image_len) {
+            let already_paused = matches!(vm.get_state(), VmState::Paused);
+            let downtime_begin = std::time::Instant::now();
+            if !already_paused {
+                vm.pause().map_err(VmError::Pause)?;
+            }
+            let outcome = (|| {
+                let private = vm.arker_private_pages().map_err(VmError::SnapshotSend)?;
+                let bytes: u64 = private.regions().iter().map(|r| r.length).sum();
+                // Wall clock, not correctness: past roughly half the image a
+                // scattered write loses to one sequential sweep, and overrunning
+                // arkerd's snapshot timeout reaps the VM mid-write.
+                if bytes * 2 > image_len {
+                    crate::memory_manager::arker_delta_report(&format!(
+                        "CHCOW dense: pid={pid} private_MB={} of {}MB — too dirty",
+                        bytes / 1048576,
+                        image_len / 1048576
+                    ));
+                    vm.arker_precopy_memory(destination_url)
+                        .map_err(VmError::SnapshotSend)?;
+                } else {
+                    vm.arker_write_dirty_memory(destination_url, &private)
+                        .map_err(VmError::SnapshotSend)?;
+                }
+                let snapshot = vm.snapshot().map_err(VmError::Snapshot)?;
+                vm.arker_send_state_only(&snapshot, destination_url)
+                    .map_err(VmError::SnapshotSend)
+            })();
+            let resumed = if already_paused { Ok(()) } else { vm.resume() };
+            crate::memory_manager::arker_delta_report(&format!(
+                "CHLIVE downtime: pid={pid} {:.1}ms cow=true",
+                downtime_begin.elapsed().as_secs_f64() * 1000.0
+            ));
+            return outcome.and(resumed.map_err(VmError::Resume));
+        }
+    }
+
     let manual = armed;
     // The OTHER precondition, and the one that was assumed. A reflinked base
     // with a CONSUMING dirty log is the corrupting combination: the unchanged
@@ -2286,30 +2344,37 @@ impl RequestHandler for Vmm {
             //
             // Best-effort: failing to arm costs a measurement, and must not cost the
             // caller its restore.
+            // NO ARMING. This used to call `start_dirty_log()` here so a
+            // capture could read "everything dirtied since restore", and that
+            // is exactly what broke forked Windows children: arming
+            // write-protects every page so KVM can track it, and a resuming
+            // guest then faults on first write to each of ~2M pages. MEASURED:
+            // `accepting on :52123 after 110.1s` against a 45s agent budget,
+            // while the image itself was byte-perfect (`MISMATCHED=0` over
+            // 1,861,995 pages). The tax was predicted in
+            // `arker_dirty_since_restore_enabled`'s own comment and went
+            // unmeasured until it cost 6/6 fork-integrity tests.
+            //
+            // The capture reads COW state from the page tables instead
+            // (`arker_private_pages`), which the kernel maintains anyway
+            // because MAP_PRIVATE already write-protects every page. So there is
+            // nothing to arm, no epoch to keep, and no per-page tax.
+            //
+            // The BASE is still recorded: it is the image this VM was restored
+            // from, which is what a capture reflinks and writes its private
+            // pages over.
             if crate::memory_manager::arker_dirty_since_restore_enabled() {
-                if let Some(ref mut vm) = self.vm {
-                    if let Err(e) = vm.start_dirty_log() {
-                        warn!("arker: could not arm the dirty log at restore: {e}");
-                    } else {
-                        self.arker_dirty_armed = true;
-                        // This arming IS the epoch every later dirty read is
-                        // relative to, so the image we restored FROM is the one
-                        // base each capture writes a delta over. An unreadable
-                        // source URL is not a restore failure; it only means
-                        // dense captures.
-                        self.arker_dirty_base = crate::migration::url_to_path(source_url)
-                            .ok()
-                            .map(|dir| dir.join(crate::memory_manager::SNAPSHOT_FILENAME));
-                        crate::memory_manager::arker_delta_report(&format!(
-                            "CHSINCE armed: pid={} base={}",
-                            std::process::id(),
-                            self.arker_dirty_base
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "none".into())
-                        ));
-                    }
-                }
+                self.arker_dirty_base = crate::migration::url_to_path(source_url)
+                    .ok()
+                    .map(|dir| dir.join(crate::memory_manager::SNAPSHOT_FILENAME));
+                crate::memory_manager::arker_delta_report(&format!(
+                    "CHCOW base: pid={} base={}",
+                    std::process::id(),
+                    self.arker_dirty_base
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "none".into())
+                ));
             }
             if restore_cfg.resume {
                 self.vm_resume()

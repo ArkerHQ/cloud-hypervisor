@@ -3008,6 +3008,132 @@ impl MemoryManager {
     /// This is now the only way a snapshot's memory reaches disk --
     /// `MemoryManager::send` remains to satisfy `Transportable`, but nothing
     /// on the snapshot path calls it.
+    /// ARKER LIVE: the pages this guest has PRIVATELY modified, read from the
+    /// page tables rather than from a dirty log.
+    ///
+    /// # Why this exists at all
+    ///
+    /// The dirty-log version of this worked and was fast (8.90 GB -> 533 MB,
+    /// 93.6ms -> 10.6ms downtime) and still broke every forked Windows child.
+    /// Not corruption — `arker_verify_delta` reported `MISMATCHED=0` over
+    /// 1,861,995 pages, so the image was byte-perfect. The children were SLOW:
+    /// `accepting on :52123 after 110.1s` against a 45s budget. Arming KVM's
+    /// dirty log write-protects every page so KVM can track it, and a resuming
+    /// Windows guest faults on first write to each of ~2M pages. The tax was
+    /// predicted in `arker_dirty_since_restore_enabled`'s own doc comment
+    /// ("taxes the guest for its whole life ... unmeasured") and went unmeasured
+    /// until it broke forks.
+    ///
+    /// # Why this costs the guest NOTHING
+    ///
+    /// `MAP_PRIVATE` already write-protects every page — that is how COW works —
+    /// so the guest ALREADY pays that fault whether or not anything is armed,
+    /// and the kernel has ALREADY recorded the answer. A page the guest has not
+    /// written still maps the base file's page-cache page; one it has written
+    /// has been copied into private anonymous memory. `snapshot.rs` says the
+    /// same thing from the other side: "Clean pages ARE the golden file's
+    /// page-cache", and MAP_PRIVATE + POPULATE_READ "leaves 7.6 GiB" of them.
+    ///
+    /// So reading `/proc/self/pagemap` asks the kernel a question it has already
+    /// answered: ~2M entries, 8 bytes each, ~16 MiB of sequential reads. No
+    /// arming, no write-protect tax, no epoch — and therefore no
+    /// base-establishing first capture, so the FIRST fork is fast too.
+    ///
+    /// This is FC's shape. FC skips NON-RESIDENT pages and lets the FICLONE base
+    /// supply them; the CH equivalent is "skip pages still backed by the base".
+    /// Residency alone is useless here — POPULATE_READ makes everything resident
+    /// (3.8M resident for ~4.6K actually dirty) — so PRIVATENESS is the signal,
+    /// not presence.
+    ///
+    /// # Conservative on purpose
+    ///
+    /// A page is skipped ONLY when it is provably still the base's: present AND
+    /// file-backed. Anything else — absent, swapped, anonymous — is written.
+    /// Being wrong in that direction costs bytes; being wrong the other way
+    /// hands a child a page of someone else's memory.
+    pub fn arker_private_pages(&self) -> result::Result<MemoryRangeTable, MigratableError> {
+        use std::os::unix::fs::FileExt;
+
+        const PAGE: u64 = arch::PAGE_SIZE as u64;
+        /// `/proc/pid/pagemap` bit 63: the page is in RAM.
+        const PRESENT: u64 = 1 << 63;
+        /// Bit 61: file-backed or shared-anon. A MAP_PRIVATE file page that has
+        /// NOT been written still reports this; once COW'd it is private
+        /// anonymous memory and reports 0, which is exactly the distinction.
+        const FILE_PAGE: u64 = 1 << 61;
+        /// 8192 entries = 64 KiB per read; 2M pages is ~256 reads.
+        const BATCH: usize = 8192;
+
+        let pagemap = File::open("/proc/self/pagemap")
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("open pagemap: {e}")))?;
+        let guest_memory = self.guest_memory.memory();
+        let mut table = MemoryRangeTable::default();
+        let mut scanned: u64 = 0;
+        let mut private: u64 = 0;
+
+        for mapping in &self.guest_ram_mappings {
+            let Some(region) = guest_memory.find_region(GuestAddress(mapping.gpa)) else {
+                // Refuse rather than silently skip a region: a region we cannot
+                // locate is one whose pages we would wrongly call clean.
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "arker private scan: no region at gpa {:#x}",
+                    mapping.gpa
+                )));
+            };
+            let host_base = region.as_ptr() as u64;
+            let pages = mapping.size / PAGE;
+            // A run of consecutive private pages becomes ONE range, so the
+            // writer gets few long `write_volatile_to` calls rather than a
+            // storm of 4 KiB ones.
+            let mut run_start: Option<u64> = None;
+            let mut entries = vec![0u64; BATCH];
+            let mut page = 0u64;
+            while page < pages {
+                let this = ((pages - page) as usize).min(BATCH);
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        entries.as_mut_ptr() as *mut u8,
+                        this * std::mem::size_of::<u64>(),
+                    )
+                };
+                let at = ((host_base / PAGE) + page) * std::mem::size_of::<u64>() as u64;
+                pagemap
+                    .read_exact_at(bytes, at)
+                    .map_err(|e| MigratableError::MigrateSend(anyhow!("read pagemap: {e}")))?;
+                for (index, entry) in entries[..this].iter().enumerate() {
+                    scanned += 1;
+                    let still_the_base = *entry & PRESENT != 0 && *entry & FILE_PAGE != 0;
+                    let offset = (page + index as u64) * PAGE;
+                    if still_the_base {
+                        if let Some(start) = run_start.take() {
+                            table.push(MemoryRange {
+                                gpa: mapping.gpa + start,
+                                length: offset - start,
+                            });
+                        }
+                    } else {
+                        private += 1;
+                        run_start.get_or_insert(offset);
+                    }
+                }
+                page += this as u64;
+            }
+            if let Some(start) = run_start {
+                table.push(MemoryRange {
+                    gpa: mapping.gpa + start,
+                    length: mapping.size - start,
+                });
+            }
+        }
+        arker_delta_report(&format!(
+            "CHCOW scan: pid={} scanned={scanned} private={private} extents={} bytes={}",
+            std::process::id(),
+            table.regions().len(),
+            private * PAGE
+        ));
+        Ok(table)
+    }
+
     /// ARKER LIVE: does the delta path's ONE assumption actually hold?
     ///
     /// A delta capture writes only the dirty set over a reflinked base, which is

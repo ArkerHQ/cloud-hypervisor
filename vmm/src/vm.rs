@@ -3062,6 +3062,12 @@ impl Vm {
         Ok(())
     }
 
+    /// ARKER LIVE: the pages this guest has privately modified (COW), read from
+    /// the page tables. Costs the guest nothing — see the memory_manager doc.
+    pub fn arker_private_pages(&self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        self.memory_manager.lock().unwrap().arker_private_pages()
+    }
+
     /// ARKER LIVE: check the delta path's premise page by page. Diagnostic only.
     pub fn arker_verify_delta(
         &self,
