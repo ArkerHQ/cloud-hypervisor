@@ -232,7 +232,10 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         },
         serial: match vmconfig.serial.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.common.file.as_ref().unwrap())
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(vmconfig.serial.common.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
