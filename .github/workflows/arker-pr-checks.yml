@@ -1,0 +1,23 @@
+# Arker-owned PR checks (SOC 2 change management): build and test what arker-app
+# ships from this repo, on every PR to main. Kept separate from upstream CI files
+# so rebases onto upstream never conflict.
+name: arker-pr-checks
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: arker-pr-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --bin cloud-hypervisor
