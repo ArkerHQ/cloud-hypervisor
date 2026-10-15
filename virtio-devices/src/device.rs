@@ -276,7 +276,7 @@ impl VirtioCommon {
             .map(|(queue_index, _, queue_evt)| {
                 queue_evt
                     .try_clone()
-                    .map(|queue_evt| (*queue_index as u16, queue_evt))
+                    .map(|queue_evt| (*queue_index, queue_evt))
                     .map_err(|e| {
                         error!("Failed cloning queue EventFd: {e}");
                         ActivateError::BadActivate
