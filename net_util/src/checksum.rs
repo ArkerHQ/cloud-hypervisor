@@ -42,7 +42,12 @@ fn valid_checksum_start(frame: &[u8], vnet_hdr_len: usize) -> bool {
         l3 += 4;
     }
     if protocol != 0x0800 {
-        return true;
+        // Do not let an unparsed encapsulation hide an IPv4 header from this
+        // guard. IPv6 checksum offload remains valid after its fixed header.
+        return protocol == 0x86dd
+            && ethernet.len() >= l3 + 40
+            && ethernet[l3] >> 4 == 6
+            && csum_start >= l3 + 40;
     }
     if ethernet.len() < l3 + 20 || ethernet[l3] >> 4 != 4 {
         return false;
@@ -59,6 +64,34 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
 
     use super::*;
+
+    #[test]
+    fn drops_unparsed_checksum_encapsulation() {
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        // An 802.3/LLC frame must not bypass IPv4 validation through an
+        // EtherType the guard does not parse.
+        let mut frame = vec![0; 12 + 14 + 8 + 20 + 20];
+        frame[0] = 1;
+        frame[6..8].copy_from_slice(&22u16.to_le_bytes());
+        frame[24..26].copy_from_slice(&48u16.to_be_bytes());
+        frame[26..34].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        frame[34] = 0x45;
+        assert_eq!(write_frame(tx.as_raw_fd(), &frame, 12).unwrap(), 0);
+        assert_eq!(
+            rx.recv(&mut [0; 256]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // The ordinary IPv6 offload path remains usable.
+        frame[24..26].copy_from_slice(&0x86ddu16.to_be_bytes());
+        frame[26] = 0x60;
+        frame[6..8].copy_from_slice(&54u16.to_le_bytes());
+        assert_eq!(
+            write_frame(tx.as_raw_fd(), &frame, 12).unwrap(),
+            frame.len()
+        );
+        assert_eq!(rx.recv(&mut [0; 256]).unwrap(), frame.len());
+    }
 
     #[test]
     fn drops_checksum_start_inside_ipv4_header() {
