@@ -22,7 +22,7 @@ use super::{Tap, register_listener, unregister_listener, vnet_hdr_len};
 pub struct TxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
-    iovecs: IovecBuffer,
+    frame: Vec<u8>,
 }
 
 impl Default for TxVirtio {
@@ -36,7 +36,7 @@ impl TxVirtio {
         TxVirtio {
             counter_bytes: Wrapping(0),
             counter_frames: Wrapping(0),
-            iovecs: IovecBuffer::new(),
+            frame: Vec::new(),
         }
     }
 
@@ -65,8 +65,8 @@ impl TxVirtio {
 
             let mut next_desc = desc_chain.next();
 
-            let mut iovecs = self.iovecs.borrow();
-            // Parse the descriptor chain into an iovec array. On error, the
+            self.frame.clear();
+            // Copy the descriptor chain into host-owned memory. On error, the
             // offending head descriptor is still added to the used ring with
             // len 0 below, so the guest does not see a descriptor leak.
             let parse_result: Result<(), NetQueuePairError> = (|| {
@@ -83,12 +83,16 @@ impl TxVirtio {
                             .get_slice(desc_addr, desc.len() as usize)
                             .map_err(NetQueuePairError::GuestMemory)?;
                         assert!(buf.len() >= desc.len() as usize);
-                        let buf = buf.ptr_guard_mut();
-                        let iovec = libc::iovec {
-                            iov_base: buf.as_ptr().cast(),
-                            iov_len: desc.len() as libc::size_t,
-                        };
-                        iovecs.push(iovec);
+                        let offset = self.frame.len();
+                        let len = offset + desc.len() as usize;
+                        // Bound the host copy to a virtio superpacket (64 KiB,
+                        // Ethernet and vnet headers), as on the Firecracker path.
+                        if len > 65562 {
+                            return Err(NetQueuePairError::DescriptorChainInvalid);
+                        }
+                        self.frame.resize(len, 0);
+                        buf.read_slice(&mut self.frame[offset..], 0)
+                            .map_err(|e| NetQueuePairError::GuestMemory(e.into()))?;
                     } else {
                         error!(
                             "Invalid descriptor chain: address = 0x{:x} length = {} write_only = {}",
@@ -112,36 +116,33 @@ impl TxVirtio {
                 return Err(e);
             }
 
-            let bytes_sent = if iovecs.is_empty() {
+            let bytes_sent = if self.frame.is_empty() {
                 0
             } else {
-                // SAFETY: FFI call with correct arguments
-                let result = unsafe {
-                    libc::writev(
-                        tap.as_raw_fd() as libc::c_int,
-                        iovecs.as_ptr(),
-                        iovecs.len() as libc::c_int,
-                    )
+                // Transmit the same host-owned bytes that checksum validation reads.
+                let result =
+                    super::checksum::write_frame(tap.as_raw_fd(), &self.frame, vnet_hdr_len());
+
+                let result = match result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            queue.go_to_previous_position();
+                            retry_write = true;
+                            break;
+                        }
+                        if e.raw_os_error() == Some(libc::EINVAL) {
+                            error!("net: tx: dropping malformed packet: {e}");
+                            0
+                        } else {
+                            error!("net: tx: failed writing to tap: {e}");
+                            return Err(NetQueuePairError::WriteTap(e));
+                        }
+                    }
                 };
-
-                if result < 0 {
-                    let e = std::io::Error::last_os_error();
-
-                    /* EAGAIN */
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        queue.go_to_previous_position();
-                        retry_write = true;
-                        break;
-                    }
-
-                    if e.raw_os_error() == Some(libc::EINVAL) {
-                        error!("net: tx: dropping malformed packet: {e}");
-                        0
-                    } else {
-                        error!("net: tx: failed writing to tap: {e}");
-                        return Err(NetQueuePairError::WriteTap(e));
-                    }
-                } else if (result as usize) < vnet_hdr_len() {
+                if result == 0 {
+                    0
+                } else if result < vnet_hdr_len() {
                     error!("net: tx: short tap write ({result} < {})", vnet_hdr_len());
                     0
                 } else {
