@@ -488,7 +488,6 @@ impl Net {
             }
 
             avail_features |= 1 << VIRTIO_NET_F_CTRL_VQ;
-            avail_features |= 1 << VIRTIO_NET_F_STATUS;
             let queue_num = num_queues + 1;
 
             let mut config = VirtioNetConfig::default();
@@ -682,11 +681,7 @@ impl VirtioDevice for Net {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let mut config = self.config;
-        if self.common.feature_acked(VIRTIO_NET_F_STATUS.into()) {
-            config.status = VIRTIO_NET_S_LINK_UP as u16;
-        }
-        self.read_config_from_slice(config.as_slice(), offset, data);
+        self.read_config_from_slice(self.config.as_slice(), offset, data);
     }
 
     fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
@@ -873,12 +868,6 @@ impl Pausable for Net {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         self.common.resume()?;
-
-        if self.common.feature_acked(VIRTIO_NET_F_STATUS.into()) {
-            self.common
-                .trigger_interrupt(VirtioInterruptType::Config)
-                .map_err(|error| MigratableError::Resume(error.into()))?;
-        }
 
         if let Some(ctrl_queue_epoll_thread) = &self.ctrl_queue_epoll_thread {
             ctrl_queue_epoll_thread.thread().unpark();
