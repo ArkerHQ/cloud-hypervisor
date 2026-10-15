@@ -12,6 +12,8 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+#[cfg(target_arch = "x86_64")]
+use std::io;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::mem::offset_of;
 #[cfg(feature = "sev_snp")]
