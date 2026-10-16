@@ -6,7 +6,6 @@
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
 use std::{io, result};
 
@@ -116,7 +115,7 @@ impl RngEpollHandler {
 
     fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -206,7 +205,7 @@ impl Rng {
                 avail_features,
                 acked_features,
                 min_queues: 1,
-                paused: Arc::new(AtomicBool::new(paused)),
+                paused: Arc::new(crate::PauseState::new(paused)),
                 ..Default::default()
             },
             id,

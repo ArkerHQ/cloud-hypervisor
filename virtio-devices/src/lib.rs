@@ -43,7 +43,7 @@ pub use self::balloon::Balloon;
 pub use self::block::{Block, BlockState};
 pub use self::console::{Console, ConsoleResizer, Endpoint};
 pub use self::device::{
-    ActivationContext, DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
+    ActivationContext, DmaRemapping, PauseState, VirtioCommon, VirtioDevice, VirtioInterrupt,
     VirtioInterruptType, VirtioSharedMemoryList,
 };
 pub use self::epoll_helper::{

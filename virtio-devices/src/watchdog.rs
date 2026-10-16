@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::result;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
@@ -121,7 +120,7 @@ impl WatchdogEpollHandler {
 
     fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -240,7 +239,7 @@ impl Watchdog {
                 avail_features,
                 acked_features,
                 min_queues: 1,
-                paused: Arc::new(AtomicBool::new(paused)),
+                paused: Arc::new(crate::PauseState::new(paused)),
                 ..Default::default()
             },
             id,

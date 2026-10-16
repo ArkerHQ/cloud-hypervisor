@@ -4,7 +4,7 @@
 //
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::{io, result};
 
@@ -188,7 +188,7 @@ impl Vdpa {
                 avail_features,
                 acked_features,
                 min_queues: num_queues,
-                paused: Arc::new(AtomicBool::new(paused)),
+                paused: Arc::new(crate::PauseState::new(paused)),
                 ..Default::default()
             },
             id,

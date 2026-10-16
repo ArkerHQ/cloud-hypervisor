@@ -11,7 +11,7 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use log::info;
@@ -153,7 +153,7 @@ impl EpollHelper {
 
     pub fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
         handler: &mut dyn EpollHelperHandler,
     ) -> std::result::Result<(), EpollHelperError> {
@@ -163,7 +163,7 @@ impl EpollHelper {
     #[cfg(not(fuzzing))]
     pub fn run_with_timeout(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
         handler: &mut dyn EpollHelperHandler,
         timeout: i32,
@@ -176,8 +176,11 @@ impl EpollHelper {
         // to be in a paused state. This is helpful for the restore code path
         // as the device thread should not start processing anything before the
         // device has been resumed.
-        while paused.load(Ordering::SeqCst) {
-            thread::park();
+        if paused.initially_paused {
+            while paused.load(Ordering::SeqCst) {
+                thread::park();
+            }
+            paused_sync.wait();
         }
 
         loop {
@@ -236,6 +239,7 @@ impl EpollHelper {
                         // This ensures the pause event has been seen by each
                         // thread related to this virtio device.
                         let _ = self.pause_evt.read();
+                        paused_sync.wait();
                     }
                     _ => {
                         handler.handle_event(self, event)?;
@@ -250,7 +254,7 @@ impl EpollHelper {
     // and return when no epoll events are active
     pub fn run_with_timeout(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
         handler: &mut dyn EpollHelperHandler,
         _timeout: i32,
@@ -258,6 +262,13 @@ impl EpollHelper {
     ) -> std::result::Result<(), EpollHelperError> {
         const EPOLL_EVENTS_LEN: usize = 100;
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+
+        if paused.initially_paused {
+            while paused.load(Ordering::SeqCst) {
+                thread::park();
+            }
+            paused_sync.wait();
+        }
 
         loop {
             let num_events = match epoll::wait(self.epoll_file.as_raw_fd(), 0, &mut events[..]) {
@@ -308,6 +319,7 @@ impl EpollHelper {
                         // This ensures the pause event has been seen by each
                         // thread related to this virtio device.
                         let _ = self.pause_evt.read();
+                        paused_sync.wait();
                     }
                     _ => {
                         handler.handle_event(self, event)?;

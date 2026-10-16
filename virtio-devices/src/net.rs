@@ -10,9 +10,9 @@ use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::result;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Barrier};
-use std::{result, thread};
 
 use anyhow::anyhow;
 use event_monitor::event;
@@ -75,7 +75,7 @@ impl NetCtrlEpollHandler {
 
     pub fn run_ctrl(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> std::result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -261,7 +261,7 @@ impl NetEpollHandler {
 
     fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -400,7 +400,6 @@ pub struct Net {
     id: String,
     taps: Vec<Tap>,
     config: VirtioNetConfig,
-    ctrl_queue_epoll_thread: Option<thread::JoinHandle<()>>,
     counters: NetCounters,
     seccomp_action: SeccompAction,
     rate_limiter_config: Option<RateLimiterConfig>,
@@ -514,13 +513,12 @@ impl Net {
                 queue_sizes,
                 paused_sync: Some(Arc::new(Barrier::new((num_queues / 2) + 1))),
                 min_queues: 2,
-                paused: Arc::new(AtomicBool::new(paused)),
+                paused: Arc::new(crate::PauseState::new(paused)),
                 ..Default::default()
             },
             id,
             taps,
             config,
-            ctrl_queue_epoll_thread: None,
             counters: NetCounters::default(),
             seccomp_action,
             rate_limiter_config,
@@ -649,17 +647,8 @@ impl Net {
 
 impl Drop for Net {
     fn drop(&mut self) {
-        if let Some(kill_evt) = self.common.kill_evt.take() {
-            // Ignore the result because there is nothing we can do about it.
-            let _ = kill_evt.write(1);
-        }
         // Needed to ensure all references to tap FDs are dropped (#4868)
-        self.common.wait_for_epoll_threads();
-        if let Some(thread) = self.ctrl_queue_epoll_thread.take()
-            && let Err(e) = thread.join()
-        {
-            error!("Error joining thread: {e:?}");
-        }
+        self.common.reset();
     }
 }
 
@@ -737,10 +726,9 @@ impl VirtioDevice for Net {
                 interrupt_cb.clone(),
                 move || ctrl_handler.run_ctrl(&paused, paused_sync.as_ref().unwrap()),
             )?;
-            self.ctrl_queue_epoll_thread = Some(epoll_threads.remove(0));
+            self.common.epoll_threads = Some(epoll_threads);
         }
 
-        let mut epoll_threads = Vec::new();
         let mut taps = self.taps.clone();
         for i in 0..queues.len() / 2 {
             let rx = RxVirtio::new();
@@ -810,15 +798,13 @@ impl VirtioDevice for Net {
                 &format!("{}_qp{}", self.id.clone(), i),
                 &self.seccomp_action,
                 Thread::VirtioNet,
-                &mut epoll_threads,
+                self.common.epoll_threads.get_or_insert_with(Vec::new),
                 &self.exit_evt,
                 self.device_status.clone(),
                 interrupt_cb.clone(),
                 move || handler.run(&paused, paused_sync.as_ref().unwrap()),
             )?;
         }
-
-        self.common.epoll_threads = Some(epoll_threads);
 
         event!("virtio-device", "activated", "id", &self.id);
         Ok(())
@@ -867,12 +853,7 @@ impl Pausable for Net {
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
-        self.common.resume()?;
-
-        if let Some(ctrl_queue_epoll_thread) = &self.ctrl_queue_epoll_thread {
-            ctrl_queue_epoll_thread.thread().unpark();
-        }
-        Ok(())
+        self.common.resume()
     }
 }
 

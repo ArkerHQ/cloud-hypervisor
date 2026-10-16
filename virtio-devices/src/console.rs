@@ -311,7 +311,7 @@ impl ConsoleEpollHandler {
 
     fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -664,7 +664,7 @@ impl Console {
                     acked_features,
                     paused_sync: Some(Arc::new(Barrier::new(2))),
                     min_queues: NUM_QUEUES as u16,
-                    paused: Arc::new(AtomicBool::new(paused)),
+                    paused: Arc::new(crate::PauseState::new(paused)),
                     ..Default::default()
                 },
                 id,

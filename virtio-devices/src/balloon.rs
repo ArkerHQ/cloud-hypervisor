@@ -18,7 +18,6 @@ use std::io::{self, Write};
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::result;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
 
 use anyhow::anyhow;
@@ -402,7 +401,7 @@ impl BalloonEpollHandler {
 
     fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -549,7 +548,7 @@ impl Balloon {
                 paused_sync: Some(Arc::new(Barrier::new(2))),
                 queue_sizes,
                 min_queues: MIN_NUM_QUEUES as u16,
-                paused: Arc::new(AtomicBool::new(paused)),
+                paused: Arc::new(crate::PauseState::new(paused)),
                 ..Default::default()
             },
             id,

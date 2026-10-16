@@ -160,7 +160,7 @@ since the backend only supports {backend_num_queues}\n",
                     queue_sizes: request_queue_sizes,
                     paused_sync: Some(Arc::new(Barrier::new(2))),
                     min_queues: 1,
-                    paused: Arc::new(AtomicBool::new(paused)),
+                    paused: Arc::new(crate::PauseState::new(paused)),
                     ..Default::default()
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
@@ -344,7 +344,7 @@ impl VirtioDevice for GenericVhostUser {
             interrupt_cb.clone(),
             move || handler.run(&paused, paused_sync.as_ref().unwrap()),
         )?;
-        self.vu_common.epoll_thread = Some(epoll_threads.remove(0));
+        self.vu_common.virtio_common.epoll_threads = Some(epoll_threads);
 
         event!("virtio-device", "activated", "id", &self.id);
         Ok(())
@@ -404,10 +404,6 @@ impl Pausable for GenericVhostUser {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         self.vu_common.virtio_common.resume()?;
-
-        if let Some(epoll_thread) = &self.vu_common.epoll_thread {
-            epoll_thread.thread().unpark();
-        }
 
         self.vu_common.resume()
     }

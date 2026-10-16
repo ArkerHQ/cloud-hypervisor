@@ -1,12 +1,12 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::io;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::{io, thread};
 
 use anyhow::anyhow;
 use event_monitor::event;
@@ -283,7 +283,7 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
     pub fn run(
         &mut self,
-        paused: &AtomicBool,
+        paused: &crate::PauseState,
         paused_sync: &Barrier,
     ) -> std::result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
@@ -463,7 +463,6 @@ pub struct VhostUserCommon {
     pub migration_started: bool,
     pub server: bool,
     pub vring_bases: Option<Vec<u64>>,
-    pub epoll_thread: Option<thread::JoinHandle<()>>,
     /// Indicates that the backend is no longer reachable. Shared with EPollHandler.
     pub disconnected: Arc<AtomicBool>,
 }
@@ -566,15 +565,9 @@ impl VhostUserCommon {
             }
         }
 
-        if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
-            // Ignore the result because there is nothing we can do about it.
-            let _ = kill_evt.write(1);
-        }
+        self.virtio_common.reset();
 
         event!("virtio-device", "reset", "id", id);
-
-        // Drop the interrupt callback clone
-        self.virtio_common.interrupt_cb = None;
     }
 
     fn memory_update_error(&self, source: Error) -> crate::Error {
@@ -592,16 +585,7 @@ impl VhostUserCommon {
         // This ensures the thread drops its Arc<VhostUserHandle>, fully
         // closing the vhost-user socket so the backend can accept a new
         // connection from the destination.
-        if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
-            let _ = kill_evt.write(1);
-        }
-        self.virtio_common.paused.store(false, Ordering::SeqCst);
-        if let Some(t) = self.epoll_thread.as_ref() {
-            t.thread().unpark();
-        }
-        if let Some(t) = self.epoll_thread.take() {
-            let _ = t.join();
-        }
+        self.virtio_common.reset();
 
         // Remove socket path if needed
         if self.server {

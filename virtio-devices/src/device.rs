@@ -221,6 +221,30 @@ pub trait DmaRemapping {
     ) -> std::result::Result<u64, std::io::Error>;
 }
 
+/// The initial pause belongs to restore, not to a worker's pause barrier.
+#[derive(Default)]
+pub struct PauseState {
+    paused: AtomicBool,
+    pub(crate) initially_paused: bool,
+}
+
+impl PauseState {
+    pub fn new(paused: bool) -> Self {
+        Self {
+            paused: AtomicBool::new(paused),
+            initially_paused: paused,
+        }
+    }
+}
+
+impl std::ops::Deref for PauseState {
+    type Target = AtomicBool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.paused
+    }
+}
+
 /// Structure to handle device state common to all devices
 #[derive(Default)]
 pub struct VirtioCommon {
@@ -229,7 +253,7 @@ pub struct VirtioCommon {
     pub kill_evt: Option<EventFd>,
     pub interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
     pub pause_evt: Option<EventFd>,
-    pub paused: Arc<AtomicBool>,
+    pub paused: Arc<PauseState>,
     pub paused_sync: Option<Arc<Barrier>>,
     pub epoll_threads: Option<Vec<thread::JoinHandle<()>>>,
     pub queue_sizes: Vec<u16>,
@@ -325,6 +349,7 @@ impl VirtioCommon {
             }
         }
 
+        self.paused = Arc::new(PauseState::default());
         // Drop the interrupt callback clone
         self.interrupt_cb = None;
     }
@@ -406,10 +431,23 @@ impl Pausable for VirtioCommon {
             "Resuming virtio-{}",
             VirtioDeviceType::from(self.device_type)
         );
-        self.paused.store(false, Ordering::SeqCst);
+        let was_paused = self.paused.swap(false, Ordering::SeqCst);
         if let Some(epoll_threads) = &self.epoll_threads {
             for t in epoll_threads.iter() {
                 t.thread().unpark();
+            }
+        }
+
+        // A later pause must not overtake workers still parked in this one.
+        if was_paused {
+            if self
+                .epoll_threads
+                .as_ref()
+                .is_some_and(|threads| !threads.is_empty())
+            {
+                self.paused_sync.as_ref().unwrap().wait();
+            } else {
+                self.paused = Arc::new(PauseState::default());
             }
         }
 
@@ -435,9 +473,75 @@ impl Pausable for VirtioCommon {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    use super::*;
+    use crate::epoll_helper::{EpollHelper, EpollHelperError, EpollHelperHandler};
+
+    struct NoEvents;
+
+    impl EpollHelperHandler for NoEvents {
+        fn handle_event(
+            &mut self,
+            _helper: &mut EpollHelper,
+            _event: &epoll::Event,
+        ) -> Result<(), EpollHelperError> {
+            unreachable!("only pause and kill events are registered")
+        }
+    }
+
+    #[test]
+    fn rapid_pause_resume_and_reset_join_every_worker() {
+        for initially_paused in [false, true] {
+            for workers in [1, 3] {
+                let mut device = VirtioCommon {
+                    paused: Arc::new(PauseState::new(initially_paused)),
+                    paused_sync: Some(Arc::new(Barrier::new(workers + 1))),
+                    kill_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
+                    pause_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
+                    epoll_threads: Some(Vec::new()),
+                    ..Default::default()
+                };
+                for _ in 0..workers {
+                    let (kill, pause) = device.dup_eventfds();
+                    let paused = device.paused.clone();
+                    let barrier = device.paused_sync.clone().unwrap();
+                    device
+                        .epoll_threads
+                        .as_mut()
+                        .unwrap()
+                        .push(thread::spawn(move || {
+                            EpollHelper::new(&kill, &pause)
+                                .unwrap()
+                                .run(&paused, &barrier, &mut NoEvents)
+                                .unwrap();
+                        }));
+                }
+                if initially_paused {
+                    device.resume().unwrap();
+                }
+                for _ in 0..1000 {
+                    device.pause().unwrap();
+                    device.resume().unwrap();
+                }
+                device.pause().unwrap();
+                device.reset();
+                assert!(!device.paused.initially_paused);
+                assert!(device.epoll_threads.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn resuming_an_inactive_restored_device_clears_its_initial_pause() {
+        let mut device = VirtioCommon {
+            paused: Arc::new(PauseState::new(true)),
+            ..Default::default()
+        };
+        device.resume().unwrap();
+        assert!(!device.paused.initially_paused);
+    }
 
     #[test]
     fn resume_waits_for_the_worker_to_leave_its_paused_phase() {
@@ -450,7 +554,7 @@ mod tests {
             }
         });
         let mut device = VirtioCommon {
-            paused: Arc::new(AtomicBool::new(true)),
+            paused: Arc::new(PauseState::new(true)),
             paused_sync: Some(barrier),
             kill_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
             pause_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
@@ -463,7 +567,10 @@ mod tests {
             done.send(()).unwrap();
             device
         });
-        let blocked = matches!(resumed.recv_timeout(Duration::from_secs(1)), Err(mpsc::RecvTimeoutError::Timeout));
+        let blocked = matches!(
+            resumed.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
         release.send(blocked).unwrap();
         let mut device = owner.join().unwrap();
         for worker in device.epoll_threads.take().unwrap() {
