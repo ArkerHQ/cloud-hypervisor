@@ -3101,13 +3101,6 @@ impl Vm {
     /// of guest RAM a second time with the vCPUs stopped -- reintroducing the
     /// exact cost this path exists to remove.
     ///
-    /// The two file-writes below deliberately mirror upstream's rather than
-    /// factoring out a shared helper: sharing one would mean editing
-    /// `Transportable::send` too, and every line changed there is a line to
-    /// reconcile on the next rebase onto upstream. The copy is small, but it
-    /// IS a copy -- upstream's version still uses `write` where these use
-    /// `write_all`, and a short write truncates `state.json` into a device
-    /// state the restore cannot parse.
     pub fn arker_send_state_only(
         &self,
         snapshot: &Snapshot,
@@ -3121,8 +3114,8 @@ impl Vm {
             .create_new(true)
             .open(snapshot_config_path)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-        let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        let cpus = self.cpu_manager.lock().unwrap().snapshot_vcpu_count();
+        let vm_config = snapshot_config(self.config.lock().unwrap().deref(), cpus)?;
         snapshot_config_file
             .write_all(vm_config.as_bytes())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
@@ -3475,49 +3468,39 @@ impl Snapshottable for Vm {
     }
 }
 
+fn snapshot_config(config: &VmConfig, cpus: u32) -> std::result::Result<String, MigratableError> {
+    let mut captured =
+        serde_json::to_value(config).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+    // The requested count may precede the guest's CPU-removal acknowledgement.
+    captured["cpus"]["boot_vcpus"] = cpus.into();
+    serde_json::to_string(&captured).map_err(|e| MigratableError::MigrateSend(e.into()))
+}
+
+#[cfg(test)]
+mod snapshot_config_tests {
+    use super::*;
+
+    #[test]
+    fn capture_records_actual_cpus_without_changing_the_live_request() {
+        let config: VmConfig =
+            serde_json::from_str(r#"{"cpus":{"boot_vcpus":1,"max_vcpus":4}}"#).unwrap();
+        for actual in [1, 2, 4] {
+            let captured: VmConfig =
+                serde_json::from_str(&snapshot_config(&config, actual).unwrap()).unwrap();
+            assert_eq!(captured.cpus.boot_vcpus, actual);
+            assert_eq!(captured.cpus.max_vcpus, 4);
+            assert_eq!(config.cpus.boot_vcpus, 1);
+        }
+    }
+}
+
 impl Transportable for Vm {
     fn send(
         &self,
         snapshot: &Snapshot,
         destination_url: &str,
     ) -> std::result::Result<(), MigratableError> {
-        let mut snapshot_config_path = url_to_path(destination_url)?;
-        snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
-
-        // Create the snapshot config file
-        let mut snapshot_config_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(snapshot_config_path)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        // Serialize and write the snapshot config
-        let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        snapshot_config_file
-            .write(vm_config.as_bytes())
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        let mut snapshot_state_path = url_to_path(destination_url)?;
-        snapshot_state_path.push(SNAPSHOT_STATE_FILE);
-
-        // Create the snapshot state file
-        let mut snapshot_state_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(snapshot_state_path)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        // Serialize and write the snapshot state
-        let vm_state =
-            serde_json::to_vec(snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        snapshot_state_file
-            .write(&vm_state)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        self.arker_send_state_only(snapshot, destination_url)?;
 
         // Tell the memory manager to also send/write its own snapshot.
         if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {

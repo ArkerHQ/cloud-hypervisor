@@ -774,6 +774,13 @@ struct VcpuState {
 }
 
 impl VcpuState {
+    fn snapshot_span(states: &[Self]) -> u32 {
+        states
+            .iter()
+            .rposition(Self::active)
+            .map_or(0, |id| id as u32 + 1)
+    }
+
     fn active(&self) -> bool {
         self.handle.is_some()
     }
@@ -1678,6 +1685,11 @@ impl CpuManager {
     pub fn common_cpuid(&self) -> Vec<CpuIdEntry> {
         assert!(!self.cpuid.is_empty());
         self.cpuid.clone()
+    }
+
+    /// Capture every live CPU ID without resurrecting retired trailing slots.
+    pub fn snapshot_vcpu_count(&self) -> u32 {
+        VcpuState::snapshot_span(&self.vcpu_states.lock().unwrap())
     }
 
     /// Locks the vCPU states and calls [`Self::active_vcpus`].
@@ -3302,6 +3314,26 @@ impl BusDevice for AcpiCpuHotplugController {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod restore_cpu_tests {
+    use super::*;
+
+    #[test]
+    fn capture_keeps_live_ids_but_not_retired_allocations() {
+        let mut states: Vec<_> = (0..4).map(|_| VcpuState::default()).collect();
+        for id in [0, 1, 3] {
+            states[id].handle = Some(thread::spawn(|| {}));
+        }
+        assert_eq!(VcpuState::snapshot_span(&states), 4);
+        states[3].handle.take().unwrap().join().unwrap();
+        assert_eq!(VcpuState::snapshot_span(&states), 2);
+        states[1].handle.take().unwrap().join().unwrap();
+        assert_eq!(VcpuState::snapshot_span(&states), 1);
+        states[0].handle.take().unwrap().join().unwrap();
+        assert_eq!(VcpuState::snapshot_span(&states), 0);
     }
 }
 
