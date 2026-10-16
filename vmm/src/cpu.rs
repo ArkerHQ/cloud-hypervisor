@@ -839,6 +839,11 @@ impl VcpuState {
     }
 }
 
+fn initial_vcpu_count(boot_vcpus: u32, snapshot: Option<&Snapshot>) -> u32 {
+    // A requested shrink need not have been acknowledged by every guest CPU.
+    snapshot.map_or(boot_vcpus, |state| state.snapshots.len() as u32)
+}
+
 impl CpuManager {
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
@@ -1535,7 +1540,7 @@ impl CpuManager {
     ) -> Result<Vec<Arc<Mutex<Vcpu>>>> {
         trace_scoped!("create_boot_vcpus");
 
-        self.create_vcpus(self.boot_vcpus(), snapshot)
+        self.create_vcpus(initial_vcpu_count(self.boot_vcpus(), snapshot), snapshot)
     }
 
     // Starts all the vCPUs that the VM is booting with. Blocks until all vCPUs are running.
@@ -3302,6 +3307,21 @@ impl BusDevice for AcpiCpuHotplugController {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod restore_cpu_tests {
+    use super::*;
+
+    #[test]
+    fn restore_keeps_cpus_whose_hot_unplug_has_not_completed() {
+        let mut snapshot = Snapshot::default();
+        snapshot.add_snapshot("0".into(), Snapshot::default());
+        snapshot.add_snapshot("1".into(), Snapshot::default());
+        assert_eq!(initial_vcpu_count(1, Some(&snapshot)), 2);
+        assert_eq!(initial_vcpu_count(4, Some(&snapshot)), 2);
+        assert_eq!(initial_vcpu_count(1, None), 1);
     }
 }
 
