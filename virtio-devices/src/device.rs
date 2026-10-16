@@ -432,3 +432,43 @@ impl Pausable for VirtioCommon {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn resume_waits_for_the_worker_to_leave_its_paused_phase() {
+        let barrier = Arc::new(Barrier::new(2));
+        let (release, held) = mpsc::channel();
+        let worker_barrier = barrier.clone();
+        let worker = thread::spawn(move || {
+            if held.recv().unwrap() {
+                worker_barrier.wait();
+            }
+        });
+        let mut device = VirtioCommon {
+            paused: Arc::new(AtomicBool::new(true)),
+            paused_sync: Some(barrier),
+            kill_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
+            pause_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
+            epoll_threads: Some(vec![worker]),
+            ..Default::default()
+        };
+        let (done, resumed) = mpsc::channel();
+        let owner = thread::spawn(move || {
+            device.resume().unwrap();
+            done.send(()).unwrap();
+            device
+        });
+        let blocked = matches!(resumed.recv_timeout(Duration::from_secs(1)), Err(mpsc::RecvTimeoutError::Timeout));
+        release.send(blocked).unwrap();
+        let mut device = owner.join().unwrap();
+        for worker in device.epoll_threads.take().unwrap() {
+            worker.join().unwrap();
+        }
+        assert!(blocked, "resume returned before its worker acknowledged it");
+    }
+}
