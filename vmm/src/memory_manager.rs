@@ -3046,18 +3046,20 @@ impl MemoryManager {
         let mut memory_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create_new(presize)
             .truncate(false)
             .open(&memory_file_path)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
-        if presize {
+        let sparse = if presize {
             let total_len: u64 = layout.regions().iter().map(|r| r.length).sum();
             // Best-effort, as the dense path treats it: a filesystem that
             // refuses ftruncate-extend still gets a complete image, because
             // every region below is written at its own offset anyway.
-            let _ = memory_file.set_len(total_len);
-        }
+            memory_file.set_len(total_len).is_ok()
+        } else {
+            false
+        };
 
         // The dense layout is defined by `layout`, NOT by the
         // table being written: a dirty range's file offset is its position in
@@ -3072,24 +3074,7 @@ impl MemoryManager {
                 memory_file
                     .seek(SeekFrom::Start(at))
                     .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                let mut off: u64 = 0;
-                while off < dlen {
-                    let n = guest_memory
-                        .write_volatile_to(
-                            GuestAddress(dgpa + off),
-                            &mut memory_file,
-                            (dlen - off) as usize,
-                        )
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                    // Same no-progress guard as the dense path: a zero-length
-                    // write is legal and would spin here forever.
-                    if n == 0 {
-                        return Err(MigratableError::MigrateSend(anyhow!(
-                            "arker live: no progress writing gpa={dgpa:#x} off={off} len={dlen}"
-                        )));
-                    }
-                    off += n as u64;
-                }
+                write_guest_range(&guest_memory, &mut memory_file, dgpa, dlen, sparse)?;
                 written += dlen;
             }
             file_cursor += region.length;
@@ -3536,21 +3521,42 @@ fn cow_enabled(env: Option<&str>) -> bool {
     env == Some("1")
 }
 
+/// Copy the authoritative guest VA. Only the fresh pre-copy image may skip
+/// zeros; the post-pause dirty overlay must overwrite earlier nonzero bytes.
+fn write_guest_range(
+    memory: &GuestMemoryMmap,
+    file: &mut File,
+    gpa: u64,
+    len: u64,
+    _sparse: bool,
+) -> result::Result<(), MigratableError> {
+    let mut off = 0;
+    while off < len {
+        let n = memory
+            .write_volatile_to(GuestAddress(gpa + off), file, (len - off) as usize)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        if n == 0 {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "arker live: no progress writing gpa={gpa:#x} off={off} len={len}"
+            )));
+        }
+        off += n as u64;
+    }
+    Ok(())
+}
+
 /// Write a single guest RAM region to the snapshot file at `dst_offset`,
 /// streaming populated extents via `SEEK_DATA` / `SEEK_HOLE` on the
 /// backing fd. `set_len(total)` must have been called on `dst` by the
 /// caller. Returns `Ok(true)` if the region was written sparsely, or
 /// `Ok(false)` if `SEEK_HOLE` is unsupported on the source fd (caller
 /// should fall back to dense write).
-/// `skip_zero_chunks` requires the destination range to be initially zero;
-/// never use it for an overlay or an existing nonzero destination.
 fn write_region_sparse(
     src: &File,
     src_offset: u64,
     dst: &File,
     dst_offset: u64,
     len: u64,
-    skip_zero_chunks: bool,
 ) -> io::Result<bool> {
     let src_fd = src.as_fd();
     let end = src_offset
@@ -3566,7 +3572,6 @@ fn write_region_sparse(
     };
 
     const CHUNK: usize = 1 << 20;
-    const ZERO_BLOCK: [u8; 4096] = [0; 4096];
     let mut buf = vec![0u8; CHUNK];
 
     while let Some((data_off, ext_len)) = next {
@@ -3584,14 +3589,6 @@ fn write_region_sparse(
                     io::ErrorKind::UnexpectedEof,
                     "read_at returned 0 inside data extent",
                 ));
-            }
-            if skip_zero_chunks
-                && slice[..read]
-                    .chunks(ZERO_BLOCK.len())
-                    .all(|chunk| chunk == &ZERO_BLOCK[..chunk.len()])
-            {
-                written += read as u64;
-                continue;
             }
             let mut wrote_total = 0;
             while wrote_total < read {
@@ -4226,9 +4223,6 @@ impl Transportable for MemoryManager {
                     &memory_file,
                     file_cursor,
                     range.length,
-                    // Dense captures create a fresh, pre-sized file above;
-                    // the overlay branch never reaches this path.
-                    true,
                 )
                 .map_err(|e| MigratableError::MigrateSend(e.into()))?;
             }
@@ -4550,11 +4544,12 @@ impl Migratable for MemoryManager {
 
 #[cfg(test)]
 mod unit_tests {
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
     use std::os::unix::fs::FileExt;
 
-    use super::{cow_enabled, delta_enabled, next_data_extent, write_region_sparse};
+    use super::{cow_enabled, delta_enabled, next_data_extent, write_guest_range, write_region_sparse};
+    use vm_memory::{Bytes, GuestAddress};
 
     // The two flags default in OPPOSITE directions, which is the whole reason
     // they are separate predicates and worth pinning: delta is on unless
@@ -4717,7 +4712,7 @@ mod unit_tests {
         let dst = tmp.reopen().unwrap();
         dst.write_all_at(&vec![0xFE; 4096 * 16], 0).unwrap();
 
-        let used = write_region_sparse(&src, 0, &dst, 0, 4096 * 16, false).unwrap();
+        let used = write_region_sparse(&src, 0, &dst, 0, 4096 * 16).unwrap();
         assert!(used);
 
         let buf = std::fs::read(tmp.path()).unwrap();
@@ -4729,11 +4724,12 @@ mod unit_tests {
     #[test]
     fn zero_chunks_in_a_fresh_region_remain_holes() {
         const MIB: usize = 1 << 20;
-        let src = make_memfd((3 * MIB) as u64);
-        src.write_all_at(&vec![0; 3 * MIB], 0).unwrap();
-        src.write_all_at(&[0x42], (MIB + 7) as u64).unwrap();
-        let dst = make_memfd((5 * MIB) as u64);
-        assert!(write_region_sparse(&src, 0, &dst, MIB as u64, (3 * MIB) as u64, true).unwrap());
+        let src = crate::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * MIB)]).unwrap();
+        src.write_slice(&vec![0; 3 * MIB], GuestAddress(0)).unwrap();
+        src.write_slice(&[0x42], GuestAddress((MIB + 7) as u64)).unwrap();
+        let mut dst = make_memfd((5 * MIB) as u64);
+        dst.seek(SeekFrom::Start(MIB as u64)).unwrap();
+        write_guest_range(&src, &mut dst, 0, (3 * MIB) as u64, true).unwrap();
         assert_eq!(
             collect_extents(dst.as_fd(), 0, (5 * MIB) as u64).unwrap(),
             vec![((2 * MIB) as u64, MIB as u64)]
@@ -4747,11 +4743,10 @@ mod unit_tests {
 
     #[test]
     fn allocated_zeros_overwrite_an_existing_destination() {
-        let src = make_memfd(4096);
-        src.write_all_at(&[0; 4096], 0).unwrap();
-        let dst = make_memfd(4096);
+        let src = crate::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut dst = make_memfd(4096);
         dst.write_all_at(&[0xFE; 4096], 0).unwrap();
-        assert!(write_region_sparse(&src, 0, &dst, 0, 4096, false).unwrap());
+        write_guest_range(&src, &mut dst, 0, 4096, false).unwrap();
         let mut actual = [0xFE; 4096];
         dst.read_exact_at(&mut actual, 0).unwrap();
         assert_eq!(actual, [0; 4096]);
@@ -4768,8 +4763,8 @@ mod unit_tests {
         let dst = tmp.reopen().unwrap();
         sparse_layout(&dst, 4096 * 32, &[]);
 
-        let _ = write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16, false).unwrap();
-        let _ = write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16, false).unwrap();
+        let _ = write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
+        let _ = write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
 
         let buf = std::fs::read(tmp.path()).unwrap();
         assert!(buf[..4096].iter().all(|&b| b == 0));
@@ -4789,7 +4784,7 @@ mod unit_tests {
         let dst = tmp.reopen().unwrap();
         sparse_layout(&dst, 4096 * 16, &[]);
 
-        let used = write_region_sparse(&src, 4096 * 16, &dst, 0, 4096 * 16, false).unwrap();
+        let used = write_region_sparse(&src, 4096 * 16, &dst, 0, 4096 * 16).unwrap();
         assert!(used);
 
         let buf = std::fs::read(tmp.path()).unwrap();
@@ -4815,8 +4810,8 @@ mod unit_tests {
         let total = 4096u64 * 32;
         sparse_layout(&dst, total, &[]);
 
-        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16, false).unwrap();
-        write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16, false).unwrap();
+        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
+        write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
 
         // Read back using next_data_extent + read_at, mirroring
         // fill_saved_regions's sparse restore path.
