@@ -3542,13 +3542,15 @@ fn cow_enabled(env: Option<&str>) -> bool {
 /// caller. Returns `Ok(true)` if the region was written sparsely, or
 /// `Ok(false)` if `SEEK_HOLE` is unsupported on the source fd (caller
 /// should fall back to dense write).
+/// `skip_zero_chunks` requires the destination range to be initially zero;
+/// never use it for an overlay or an existing nonzero destination.
 fn write_region_sparse(
     src: &File,
     src_offset: u64,
     dst: &File,
     dst_offset: u64,
     len: u64,
-    _skip_zero_chunks: bool,
+    skip_zero_chunks: bool,
 ) -> io::Result<bool> {
     let src_fd = src.as_fd();
     let end = src_offset
@@ -3564,6 +3566,7 @@ fn write_region_sparse(
     };
 
     const CHUNK: usize = 1 << 20;
+    const ZERO_BLOCK: [u8; 4096] = [0; 4096];
     let mut buf = vec![0u8; CHUNK];
 
     while let Some((data_off, ext_len)) = next {
@@ -3581,6 +3584,14 @@ fn write_region_sparse(
                     io::ErrorKind::UnexpectedEof,
                     "read_at returned 0 inside data extent",
                 ));
+            }
+            if skip_zero_chunks
+                && slice[..read]
+                    .chunks(ZERO_BLOCK.len())
+                    .all(|chunk| chunk == &ZERO_BLOCK[..chunk.len()])
+            {
+                written += read as u64;
+                continue;
             }
             let mut wrote_total = 0;
             while wrote_total < read {
@@ -4215,7 +4226,9 @@ impl Transportable for MemoryManager {
                     &memory_file,
                     file_cursor,
                     range.length,
-                    false,
+                    // Dense captures create a fresh, pre-sized file above;
+                    // the overlay branch never reaches this path.
+                    true,
                 )
                 .map_err(|e| MigratableError::MigrateSend(e.into()))?;
             }
