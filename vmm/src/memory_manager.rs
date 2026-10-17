@@ -3548,6 +3548,7 @@ fn write_region_sparse(
     dst: &File,
     dst_offset: u64,
     len: u64,
+    _skip_zero_chunks: bool,
 ) -> io::Result<bool> {
     let src_fd = src.as_fd();
     let end = src_offset
@@ -4214,6 +4215,7 @@ impl Transportable for MemoryManager {
                     &memory_file,
                     file_cursor,
                     range.length,
+                    false,
                 )
                 .map_err(|e| MigratableError::MigrateSend(e.into()))?;
             }
@@ -4702,13 +4704,44 @@ mod unit_tests {
         let dst = tmp.reopen().unwrap();
         dst.write_all_at(&vec![0xFE; 4096 * 16], 0).unwrap();
 
-        let used = write_region_sparse(&src, 0, &dst, 0, 4096 * 16).unwrap();
+        let used = write_region_sparse(&src, 0, &dst, 0, 4096 * 16, false).unwrap();
         assert!(used);
 
         let buf = std::fs::read(tmp.path()).unwrap();
         assert!(buf[..4096 * 3].iter().all(|&b| b == 0xFE));
         assert!(buf[4096 * 3..4096 * 5].iter().all(|&b| b == 0x42));
         assert!(buf[4096 * 5..].iter().all(|&b| b == 0xFE));
+    }
+
+    #[test]
+    fn zero_chunks_in_a_fresh_region_remain_holes() {
+        const MIB: usize = 1 << 20;
+        let src = make_memfd((3 * MIB) as u64);
+        src.write_all_at(&vec![0; 3 * MIB], 0).unwrap();
+        src.write_all_at(&[0x42], (MIB + 7) as u64).unwrap();
+        let dst = make_memfd((5 * MIB) as u64);
+        assert!(write_region_sparse(&src, 0, &dst, MIB as u64, (3 * MIB) as u64, true).unwrap());
+        assert_eq!(
+            collect_extents(dst.as_fd(), 0, (5 * MIB) as u64).unwrap(),
+            vec![((2 * MIB) as u64, MIB as u64)]
+        );
+        let mut actual = vec![0; 5 * MIB];
+        dst.read_exact_at(&mut actual, 0).unwrap();
+        let mut expected = vec![0; 5 * MIB];
+        expected[2 * MIB + 7] = 0x42;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn allocated_zeros_overwrite_an_existing_destination() {
+        let src = make_memfd(4096);
+        src.write_all_at(&[0; 4096], 0).unwrap();
+        let dst = make_memfd(4096);
+        dst.write_all_at(&[0xFE; 4096], 0).unwrap();
+        assert!(write_region_sparse(&src, 0, &dst, 0, 4096, false).unwrap());
+        let mut actual = [0xFE; 4096];
+        dst.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, [0; 4096]);
     }
 
     #[test]
@@ -4722,8 +4755,8 @@ mod unit_tests {
         let dst = tmp.reopen().unwrap();
         sparse_layout(&dst, 4096 * 32, &[]);
 
-        let _ = write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
-        let _ = write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
+        let _ = write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16, false).unwrap();
+        let _ = write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16, false).unwrap();
 
         let buf = std::fs::read(tmp.path()).unwrap();
         assert!(buf[..4096].iter().all(|&b| b == 0));
@@ -4743,7 +4776,7 @@ mod unit_tests {
         let dst = tmp.reopen().unwrap();
         sparse_layout(&dst, 4096 * 16, &[]);
 
-        let used = write_region_sparse(&src, 4096 * 16, &dst, 0, 4096 * 16).unwrap();
+        let used = write_region_sparse(&src, 4096 * 16, &dst, 0, 4096 * 16, false).unwrap();
         assert!(used);
 
         let buf = std::fs::read(tmp.path()).unwrap();
@@ -4769,8 +4802,8 @@ mod unit_tests {
         let total = 4096u64 * 32;
         sparse_layout(&dst, total, &[]);
 
-        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
-        write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
+        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16, false).unwrap();
+        write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16, false).unwrap();
 
         // Read back using next_data_extent + read_at, mirroring
         // fill_saved_regions's sparse restore path.
