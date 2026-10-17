@@ -3535,20 +3535,27 @@ fn write_guest_range(
     let mut buffer = Vec::new();
     let mut off = 0;
     while off < len {
-        let count = if sparse { (len - off).min(CHUNK as u64) } else { len - off } as usize;
+        let count = if sparse {
+            (len - off).min(CHUNK as u64)
+        } else {
+            len - off
+        } as usize;
         let mut prefix = [0; 64];
         let prefix_len = count.min(prefix.len());
         if sparse {
-            memory.read_slice(&mut prefix[..prefix_len], GuestAddress(gpa + off))
+            memory
+                .read_slice(&mut prefix[..prefix_len], GuestAddress(gpa + off))
                 .map_err(|e| MigratableError::MigrateSend(e.into()))?;
         }
         // Random/dirty RAM keeps the direct volatile-to-file fast path. Only
         // a zero prefix justifies copying a chunk to check it in full.
         let n = if sparse && prefix[..prefix_len].iter().all(|byte| *byte == 0) {
             buffer.resize(count, 0);
-            memory.read_slice(&mut buffer, GuestAddress(gpa + off))
+            memory
+                .read_slice(&mut buffer, GuestAddress(gpa + off))
                 .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-            if buffer.chunks(ZERO_BLOCK.len())
+            if buffer
+                .chunks(ZERO_BLOCK.len())
                 .all(|chunk| chunk == &ZERO_BLOCK[..chunk.len()])
             {
                 file.seek(SeekFrom::Current(count as i64))
@@ -3559,7 +3566,8 @@ fn write_guest_range(
             }
             count
         } else {
-            memory.write_volatile_to(GuestAddress(gpa + off), file, count)
+            memory
+                .write_volatile_to(GuestAddress(gpa + off), file, count)
                 .map_err(|e| MigratableError::MigrateSend(e.into()))?
         };
         if n == 0 {
@@ -4575,7 +4583,9 @@ mod unit_tests {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
     use std::os::unix::fs::FileExt;
 
-    use super::{cow_enabled, delta_enabled, next_data_extent, write_guest_range, write_region_sparse};
+    use super::{
+        cow_enabled, delta_enabled, next_data_extent, write_guest_range, write_region_sparse,
+    };
     use vm_memory::{Bytes, GuestAddress};
 
     // The two flags default in OPPOSITE directions, which is the whole reason
@@ -4754,7 +4764,8 @@ mod unit_tests {
         for marker in [MIB + 7, MIB + 4097] {
             let src = crate::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * MIB)]).unwrap();
             src.write_slice(&vec![0; 3 * MIB], GuestAddress(0)).unwrap();
-            src.write_slice(&[0x42], GuestAddress(marker as u64)).unwrap();
+            src.write_slice(&[0x42], GuestAddress(marker as u64))
+                .unwrap();
             let mut dst = make_memfd((5 * MIB) as u64);
             dst.seek(SeekFrom::Start(MIB as u64)).unwrap();
             write_guest_range(&src, &mut dst, 0, (3 * MIB) as u64, true).unwrap();
