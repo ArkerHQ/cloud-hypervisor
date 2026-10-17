@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read as _, Seek, SeekFrom};
+use std::io::{self, Read as _, Seek, SeekFrom, Write as _};
 use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -3528,13 +3528,40 @@ fn write_guest_range(
     file: &mut File,
     gpa: u64,
     len: u64,
-    _sparse: bool,
+    sparse: bool,
 ) -> result::Result<(), MigratableError> {
+    const CHUNK: usize = 1 << 20;
+    const ZERO_BLOCK: [u8; 4096] = [0; 4096];
+    let mut buffer = Vec::new();
     let mut off = 0;
     while off < len {
-        let n = memory
-            .write_volatile_to(GuestAddress(gpa + off), file, (len - off) as usize)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        let count = if sparse { (len - off).min(CHUNK as u64) } else { len - off } as usize;
+        let mut prefix = [0; 64];
+        let prefix_len = count.min(prefix.len());
+        if sparse {
+            memory.read_slice(&mut prefix[..prefix_len], GuestAddress(gpa + off))
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        }
+        // Random/dirty RAM keeps the direct volatile-to-file fast path. Only
+        // a zero prefix justifies copying a chunk to check it in full.
+        let n = if sparse && prefix[..prefix_len].iter().all(|byte| *byte == 0) {
+            buffer.resize(count, 0);
+            memory.read_slice(&mut buffer, GuestAddress(gpa + off))
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            if buffer.chunks(ZERO_BLOCK.len())
+                .all(|chunk| chunk == &ZERO_BLOCK[..chunk.len()])
+            {
+                file.seek(SeekFrom::Current(count as i64))
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            } else {
+                file.write_all(&buffer)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            }
+            count
+        } else {
+            memory.write_volatile_to(GuestAddress(gpa + off), file, count)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?
+        };
         if n == 0 {
             return Err(MigratableError::MigrateSend(anyhow!(
                 "arker live: no progress writing gpa={gpa:#x} off={off} len={len}"
@@ -4724,21 +4751,35 @@ mod unit_tests {
     #[test]
     fn zero_chunks_in_a_fresh_region_remain_holes() {
         const MIB: usize = 1 << 20;
-        let src = crate::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * MIB)]).unwrap();
-        src.write_slice(&vec![0; 3 * MIB], GuestAddress(0)).unwrap();
-        src.write_slice(&[0x42], GuestAddress((MIB + 7) as u64)).unwrap();
-        let mut dst = make_memfd((5 * MIB) as u64);
-        dst.seek(SeekFrom::Start(MIB as u64)).unwrap();
-        write_guest_range(&src, &mut dst, 0, (3 * MIB) as u64, true).unwrap();
-        assert_eq!(
-            collect_extents(dst.as_fd(), 0, (5 * MIB) as u64).unwrap(),
-            vec![((2 * MIB) as u64, MIB as u64)]
-        );
-        let mut actual = vec![0; 5 * MIB];
+        for marker in [MIB + 7, MIB + 4097] {
+            let src = crate::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * MIB)]).unwrap();
+            src.write_slice(&vec![0; 3 * MIB], GuestAddress(0)).unwrap();
+            src.write_slice(&[0x42], GuestAddress(marker as u64)).unwrap();
+            let mut dst = make_memfd((5 * MIB) as u64);
+            dst.seek(SeekFrom::Start(MIB as u64)).unwrap();
+            write_guest_range(&src, &mut dst, 0, (3 * MIB) as u64, true).unwrap();
+            assert_eq!(
+                collect_extents(dst.as_fd(), 0, (5 * MIB) as u64).unwrap(),
+                vec![((2 * MIB) as u64, MIB as u64)]
+            );
+            let mut actual = vec![0; 5 * MIB];
+            dst.read_exact_at(&mut actual, 0).unwrap();
+            let mut expected = vec![0; 5 * MIB];
+            expected[MIB + marker] = 0x42;
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn a_partial_zero_tail_keeps_exact_eof() {
+        let src = crate::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut dst = make_memfd(7);
+        write_guest_range(&src, &mut dst, 0, 7, true).unwrap();
+        assert_eq!(dst.metadata().unwrap().len(), 7);
+        assert!(collect_extents(dst.as_fd(), 0, 7).unwrap().is_empty());
+        let mut actual = [0xFE; 7];
         dst.read_exact_at(&mut actual, 0).unwrap();
-        let mut expected = vec![0; 5 * MIB];
-        expected[2 * MIB + 7] = 0x42;
-        assert_eq!(actual, expected);
+        assert_eq!(actual, [0; 7]);
     }
 
     #[test]
