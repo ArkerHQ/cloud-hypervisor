@@ -261,6 +261,11 @@ pub struct MemoryManager {
     snapshot_memory_ranges: MemoryRangeTable,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
+    /// The layout of the image the dirty log runs from, while the log has run
+    /// unbroken since that image: the one this VMM last wrote, or the one it
+    /// restored from when the log was armed before the guest ran. `None`: the
+    /// next snapshot writes every page.
+    arker_logged_image: Option<MemoryRangeTable>,
     arch_mem_regions: Vec<ArchMemRegion>,
     ram_allocator: AddressAllocator,
     dynamic: bool,
@@ -1995,6 +2000,7 @@ impl MemoryManager {
             uffd_handler: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
+            arker_logged_image: None,
             arch_mem_regions,
             ram_allocator,
             dynamic,
@@ -2087,6 +2093,14 @@ impl MemoryManager {
                         mmg.fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
                     }
                 }
+            }
+
+            if arker_dirty_log_mode() == ArkerDirtyLog::FromRestore
+                && memory_restore_mode != MemoryRestoreMode::OnDemand
+            {
+                mm.lock()
+                    .unwrap()
+                    .arker_arm_dirty_log(mem_snapshot.memory_ranges);
             }
 
             Ok(mm)
@@ -2999,8 +3013,8 @@ impl MemoryManager {
     /// is the only authoritative source. Reading anything else here is the bug
     /// that cost a forked child all of its RAM.
     ///
-    /// `presize` belongs to pass 1 only: `set_len` on pass 2 would truncate the
-    /// image pass 1 just wrote.
+    /// `presize` starts a fresh file, so it belongs to pass 1 only: on pass 2
+    /// it would discard the image pass 1 just wrote.
     ///
     /// This is now the only way a snapshot's memory reaches disk --
     /// `MemoryManager::send` remains to satisfy `Transportable`, but nothing
@@ -3037,73 +3051,112 @@ impl MemoryManager {
         // first snapshot -- MEASURED as a downtime with no write lines at all
         // -- and stale on every one after.
         let layout = self.memory_range_table(true)?;
+        self.arker_write_image(
+            destination_url,
+            &layout,
+            &arker_file_ranges(&layout, ranges),
+            presize,
+        )
+    }
+
+    /// The dense layout a snapshot taken now writes, and its restore reads.
+    pub fn arker_image_layout(&self) -> result::Result<MemoryRangeTable, MigratableError> {
+        self.memory_range_table(true)
+    }
+
+    /// Write the file extents `file_ranges` of the image laid out as `layout`
+    /// from guest memory. `fresh` starts from an empty file of the image's
+    /// length; otherwise the file must already hold the rest of the image.
+    pub fn arker_write_image(
+        &self,
+        destination_url: &str,
+        layout: &MemoryRangeTable,
+        file_ranges: &[(u64, u64)],
+        fresh: bool,
+    ) -> result::Result<(), MigratableError> {
         if layout.is_empty() {
             return Ok(());
         }
         let mut memory_file_path = url_to_path(destination_url)?;
         memory_file_path.push(String::from(SNAPSHOT_FILENAME));
-
         let mut memory_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
+            .create(fresh)
+            .truncate(fresh)
             .open(&memory_file_path)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        if presize {
-            let total_len: u64 = layout.regions().iter().map(|r| r.length).sum();
+        if fresh {
             // Best-effort, as the dense path treats it: a filesystem that
             // refuses ftruncate-extend still gets a complete image, because
-            // every region below is written at its own offset anyway.
-            let _ = memory_file.set_len(total_len);
+            // every range is written at its own offset anyway.
+            let _ = memory_file.set_len(arker_image_len(layout));
         }
-
-        // The dense layout is defined by `layout`, NOT by the
-        // table being written: a dirty range's file offset is its position in
-        // the FULL image. Walking the full list and mapping each dirty extent
-        // into it is what keeps pass 2 landing on the bytes pass 1 wrote.
-        let guest_memory = self.guest_memory.memory();
-        let mut file_cursor: u64 = 0;
-        let mut written: u64 = 0;
-        for region in layout.regions() {
-            for (dgpa, dlen) in arker_dirty_overlaps(ranges, region.gpa, region.length) {
-                let at = file_cursor + (dgpa - region.gpa);
-                memory_file
-                    .seek(SeekFrom::Start(at))
-                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                let mut off: u64 = 0;
-                while off < dlen {
-                    let n = guest_memory
-                        .write_volatile_to(
-                            GuestAddress(dgpa + off),
-                            &mut memory_file,
-                            (dlen - off) as usize,
-                        )
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                    // Same no-progress guard as the dense path: a zero-length
-                    // write is legal and would spin here forever.
-                    if n == 0 {
-                        return Err(MigratableError::MigrateSend(anyhow!(
-                            "arker live: no progress writing gpa={dgpa:#x} off={off} len={dlen}"
-                        )));
-                    }
-                    off += n as u64;
-                }
-                written += dlen;
-            }
-            file_cursor += region.length;
-        }
+        let written = arker_write_from_guest(
+            &self.guest_memory.memory(),
+            &mut memory_file,
+            layout,
+            file_ranges,
+        )?;
         // pid, because every cloud-hypervisor process on the host appends to
         // this one file. Without it, concurrent snapshots interleave and a
         // reader pairs a downtime with another VM's write -- which is how
         // "348MB in 5.1ms" nearly got reported as a result.
         arker_delta_report(&format!(
-            "CHLIVE write: pid={} presize={presize} extents={} bytes={written}",
+            "CHLIVE write: pid={} fresh={fresh} extents={} bytes={written}",
             std::process::id(),
-            ranges.regions().len()
+            file_ranges.len()
         ));
         Ok(())
+    }
+
+    /// Write the image from the dirty log when the destination holds the
+    /// image `logged` describes, laid out as now; otherwise write it whole.
+    /// Returns whether it wrote only the changes.
+    pub fn arker_write_since(
+        &self,
+        destination_url: &str,
+        logged: &MemoryRangeTable,
+        dirty: &MemoryRangeTable,
+    ) -> result::Result<bool, MigratableError> {
+        let layout = self.memory_range_table(true)?;
+        let len = arker_image_len(&layout);
+        let mut path = url_to_path(destination_url)?;
+        path.push(String::from(SNAPSHOT_FILENAME));
+        let holds_image = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == len);
+        if !holds_image || !arker_same_layout(logged, &layout) {
+            self.arker_write_image(destination_url, &layout, &[(0, len)], true)?;
+            return Ok(false);
+        }
+        let ranges = arker_with_busy_windows(&arker_file_ranges(&layout, dirty), len);
+        self.arker_write_image(destination_url, &layout, &ranges, false)?;
+        Ok(true)
+    }
+
+    /// Keep KVM's dirty log on from now, relative to `image`, the layout of
+    /// the memory the guest holds. Only KVM's half is armed: the VMM's own
+    /// bitmap has tracked every write it made since this process began, and
+    /// resetting it here would drop a device's write made before arming.
+    pub fn arker_arm_dirty_log(&mut self, image: MemoryRangeTable) {
+        match self.vm.start_dirty_log() {
+            Ok(()) => self.arker_logged_image = Some(image),
+            Err(e) => arker_delta_report(&format!(
+                "CHLOG arm failed: pid={} {e}; every save writes the whole image",
+                std::process::id()
+            )),
+        }
+    }
+
+    /// The layout of the image the dirty log runs from, leaving `None`: once
+    /// a snapshot reads the log, only its success re-establishes the log.
+    pub fn arker_take_logged_image(&mut self) -> Option<MemoryRangeTable> {
+        self.arker_logged_image.take()
+    }
+
+    /// The image just written is the one the log runs from: its layout is the
+    /// one `snapshot()` recorded for the restore to read.
+    pub fn arker_log_from_snapshot(&mut self) {
+        self.arker_logged_image = Some(self.snapshot_memory_ranges.clone());
     }
 }
 
@@ -3949,6 +4002,163 @@ fn arker_dirty_overlaps(dirty: &MemoryRangeTable, gpa: u64, len: u64) -> Vec<(u6
         }
     }
     out
+}
+
+/// When this VMM keeps KVM's dirty log on, so a snapshot can write only the
+/// pages changed since the image the log runs from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArkerDirtyLog {
+    /// Each snapshot arms the log for its own pre-copy and stops it after:
+    /// every snapshot writes the whole image.
+    Off,
+    /// The log stays on after a snapshot, so the next can be incremental.
+    AfterSave,
+    /// As `AfterSave`, and armed at restore too, so the first snapshot after
+    /// a restore can be incremental over the restored image.
+    FromRestore,
+}
+
+/// `ARKER_CH_DIRTY_LOG`, set by arkerd when it starts this VMM.
+pub fn arker_dirty_log_mode() -> ArkerDirtyLog {
+    dirty_log_mode(std::env::var("ARKER_CH_DIRTY_LOG").ok().as_deref())
+}
+
+fn dirty_log_mode(env: Option<&str>) -> ArkerDirtyLog {
+    match env {
+        Some("after-save") => ArkerDirtyLog::AfterSave,
+        Some("from-restore") => ArkerDirtyLog::FromRestore,
+        _ => ArkerDirtyLog::Off,
+    }
+}
+
+/// Whether two images are laid out alike: the same ranges in the same order.
+/// Equal length is not enough, since a virtio-mem zone's plugged ranges lead
+/// the table and a different plugged set moves every offset after them.
+pub fn arker_same_layout(a: &MemoryRangeTable, b: &MemoryRangeTable) -> bool {
+    a.regions()
+        .iter()
+        .map(|r| (r.gpa, r.length))
+        .eq(b.regions().iter().map(|r| (r.gpa, r.length)))
+}
+
+pub fn arker_image_len(layout: &MemoryRangeTable) -> u64 {
+    layout.regions().iter().map(|r| r.length).sum()
+}
+
+/// The file extents, sorted and merged, that hold the guest ranges `ranges`
+/// in an image laid out as `layout`. Guest ranges outside the layout have no
+/// place in the image.
+fn arker_file_ranges(layout: &MemoryRangeTable, ranges: &MemoryRangeTable) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    for region in layout.regions() {
+        for (gpa, len) in arker_dirty_overlaps(ranges, region.gpa, region.length) {
+            out.push((cursor + gpa - region.gpa, len));
+        }
+        cursor += region.length;
+    }
+    arker_merge(out)
+}
+
+fn arker_merge(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (off, len) in ranges {
+        match out.last_mut() {
+            Some((last, last_len)) if *last + *last_len >= off => {
+                *last_len = (*last_len).max(off + len - *last);
+            }
+            _ => out.push((off, len)),
+        }
+    }
+    out
+}
+
+/// The span over which an incremental image's fragmentation is bounded.
+const ARKER_WINDOW: u64 = 2 << 20;
+/// Runs a window may take before it is rewritten whole.
+///
+/// An incremental image is a reflink of the last one with the changed pages
+/// written over it, and each run written splits the shared extent under it.
+/// Captured again and again, a busy guest's image fragments until reflinking
+/// it, and every extent-tree walk on it, takes seconds: Firecracker measured a
+/// 5.5 GiB image going from 9K to 640K extents in ten captures, and the
+/// reflink from 0.1 s to 8.9 s. A window rewritten whole is one new extent.
+const ARKER_MAX_RUNS_PER_WINDOW: usize = 16;
+
+/// `ranges` (sorted, merged file extents) with every window that holds more
+/// than `ARKER_MAX_RUNS_PER_WINDOW` of them widened to the whole window,
+/// clamped to `len`.
+fn arker_with_busy_windows(ranges: &[(u64, u64)], len: u64) -> Vec<(u64, u64)> {
+    let mut runs: BTreeMap<u64, usize> = BTreeMap::new();
+    for &(off, run) in ranges {
+        for window in off / ARKER_WINDOW..=(off + run - 1) / ARKER_WINDOW {
+            *runs.entry(window).or_default() += 1;
+        }
+    }
+    let busy = runs
+        .into_iter()
+        .filter(|&(_, count)| count > ARKER_MAX_RUNS_PER_WINDOW)
+        .map(|(window, _)| {
+            let start = window * ARKER_WINDOW;
+            (start, ARKER_WINDOW.min(len - start))
+        });
+    arker_merge(ranges.iter().copied().chain(busy).collect())
+}
+
+/// Each file extent of `file_ranges` as `(file offset, guest address,
+/// length)` pieces, split where the image moves from one guest range to the
+/// next.
+fn arker_file_to_guest(
+    layout: &MemoryRangeTable,
+    file_ranges: &[(u64, u64)],
+) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    for region in layout.regions() {
+        let end = cursor + region.length;
+        for &(off, len) in file_ranges {
+            let (start, stop) = (off.max(cursor), (off + len).min(end));
+            if start < stop {
+                out.push((start, region.gpa + start - cursor, stop - start));
+            }
+        }
+        cursor = end;
+    }
+    out
+}
+
+/// Write `file_ranges` of the image laid out as `layout` from guest memory,
+/// returning the bytes written.
+///
+/// Reads the guest VA, never a backing file: under `ARKER_CH_COW` guest
+/// writes land on private pages the file never sees.
+fn arker_write_from_guest(
+    guest_memory: &GuestMemoryMmap,
+    file: &mut File,
+    layout: &MemoryRangeTable,
+    file_ranges: &[(u64, u64)],
+) -> result::Result<u64, MigratableError> {
+    let mut written = 0;
+    for (at, gpa, len) in arker_file_to_guest(layout, file_ranges) {
+        file.seek(SeekFrom::Start(at))
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        let mut off = 0;
+        while off < len {
+            let n = guest_memory
+                .write_volatile_to(GuestAddress(gpa + off), file, (len - off) as usize)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            // A zero-length write is legal and would spin here forever.
+            if n == 0 {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "arker: no progress writing gpa={gpa:#x} off={off} len={len}"
+                )));
+            }
+            off += n as u64;
+        }
+        written += len;
+    }
+    Ok(written)
 }
 
 impl Transportable for MemoryManager {
@@ -4805,5 +5015,160 @@ mod unit_tests {
         assert!(restored[4096 * 5..4096 * 26].iter().all(|&b| b == 0));
         assert!(restored[4096 * 26..4096 * 30].iter().all(|&b| b == 0xBB));
         assert!(restored[4096 * 30..].iter().all(|&b| b == 0));
+    }
+}
+
+#[cfg(test)]
+mod arker_incremental_tests {
+    use std::io::Read as _;
+
+    use vm_memory::{Bytes as _, GuestAddress};
+    use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
+
+    use super::*;
+
+    const PAGE: u64 = 4096;
+
+    fn table(ranges: &[(u64, u64)]) -> MemoryRangeTable {
+        let mut table = MemoryRangeTable::default();
+        for &(gpa, length) in ranges {
+            table.push(MemoryRange { gpa, length });
+        }
+        table
+    }
+
+    fn memfd() -> File {
+        // SAFETY: memfd_create is a self-contained syscall; we own the fd.
+        let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c"arker-image".as_ptr(), 0u32) };
+        assert!(fd >= 0, "memfd_create failed");
+        // SAFETY: memfd_create returned a valid fd that we now own.
+        unsafe { File::from_raw_fd(fd as i32) }
+    }
+
+    fn contents(file: &mut File) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// xorshift64: deterministic, so a failure reproduces.
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    #[test]
+    fn the_dirty_log_mode_is_off_unless_named() {
+        assert_eq!(dirty_log_mode(None), ArkerDirtyLog::Off);
+        assert_eq!(dirty_log_mode(Some("")), ArkerDirtyLog::Off);
+        assert_eq!(dirty_log_mode(Some("1")), ArkerDirtyLog::Off);
+        assert_eq!(dirty_log_mode(Some("after-save")), ArkerDirtyLog::AfterSave);
+        assert_eq!(
+            dirty_log_mode(Some("from-restore")),
+            ArkerDirtyLog::FromRestore
+        );
+    }
+
+    #[test]
+    fn a_layout_is_the_same_only_with_the_same_ranges_in_order() {
+        let a = table(&[(1 << 32, 4 * PAGE), (0, 8 * PAGE)]);
+        assert!(arker_same_layout(&a, &a.clone()));
+        // Same length, plugged ranges moved: every offset after them moves.
+        assert!(!arker_same_layout(
+            &a,
+            &table(&[(1 << 32, 2 * PAGE), (2 << 32, 2 * PAGE), (0, 8 * PAGE)])
+        ));
+        assert!(!arker_same_layout(
+            &a,
+            &table(&[(0, 8 * PAGE), (1 << 32, 4 * PAGE)])
+        ));
+        assert!(!arker_same_layout(&a, &table(&[(1 << 32, 4 * PAGE)])));
+    }
+
+    #[test]
+    fn guest_ranges_land_at_their_offsets_in_the_layout() {
+        // A virtio-mem zone's plugged range leads the table.
+        let layout = table(&[(1 << 32, 4 * PAGE), (0, 8 * PAGE)]);
+        let dirty = table(&[
+            (0, PAGE),
+            ((1 << 32) + 3 * PAGE, 2 * PAGE),
+            (2 << 32, PAGE),
+        ]);
+        // The second range runs past its region: only the part inside it.
+        assert_eq!(
+            arker_file_ranges(&layout, &dirty),
+            vec![(3 * PAGE, 2 * PAGE)]
+        );
+        assert_eq!(
+            arker_file_to_guest(&layout, &[(3 * PAGE, 2 * PAGE)]),
+            vec![(3 * PAGE, (1 << 32) + 3 * PAGE, PAGE), (4 * PAGE, 0, PAGE)]
+        );
+    }
+
+    #[test]
+    fn a_window_past_its_runs_is_written_whole() {
+        let window = ARKER_WINDOW;
+        let runs = |first: u64, count: u64| -> Vec<(u64, u64)> {
+            (0..count).map(|i| (first + 2 * i * PAGE, PAGE)).collect()
+        };
+        let len = 4 * window;
+        let calm = runs(0, ARKER_MAX_RUNS_PER_WINDOW as u64);
+        assert_eq!(arker_with_busy_windows(&calm, len), calm);
+        let busy = runs(window, ARKER_MAX_RUNS_PER_WINDOW as u64 + 1);
+        assert_eq!(arker_with_busy_windows(&busy, len), vec![(window, window)]);
+        // The last window stops at the image's end.
+        let tail = runs(3 * window, ARKER_MAX_RUNS_PER_WINDOW as u64 + 1);
+        assert_eq!(
+            arker_with_busy_windows(&tail, 3 * window + window / 2),
+            vec![(3 * window, window / 2)]
+        );
+    }
+
+    /// Many incremental saves over one image leave it byte-identical to the
+    /// whole image written now: the property every restore relies on.
+    #[test]
+    fn an_image_saved_incrementally_equals_the_whole_image() {
+        let regions = [(0u64, 8u64 << 20), (1u64 << 32, 6u64 << 20)];
+        let mem = crate::GuestMemoryMmap::from_ranges(
+            &regions
+                .iter()
+                .map(|&(gpa, len)| (GuestAddress(gpa), len as usize))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // Out of guest order, as a virtio-mem zone's plugged ranges lead.
+        let layout = table(&[regions[1], regions[0]]);
+        let len = arker_image_len(&layout);
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        for &(gpa, size) in &regions {
+            let bytes: Vec<u8> = (0..size).map(|_| next(&mut seed) as u8).collect();
+            mem.write_slice(&bytes, GuestAddress(gpa)).unwrap();
+        }
+        let mut image = memfd();
+        arker_write_from_guest(&mem, &mut image, &layout, &[(0, len)]).unwrap();
+
+        for _ in 0..40 {
+            let mut dirty = MemoryRangeTable::default();
+            // Scattered pages, and now and then a cluster that makes a window busy.
+            let writes = 1 + next(&mut seed) % 64;
+            for _ in 0..writes {
+                let (gpa, size) = regions[(next(&mut seed) % 2) as usize];
+                let pages = if next(&mut seed) % 4 == 0 { 1 + next(&mut seed) % 8 } else { 1 };
+                let page = next(&mut seed) % (size / PAGE - pages);
+                let at = gpa + page * PAGE;
+                let bytes: Vec<u8> = (0..pages * PAGE).map(|_| next(&mut seed) as u8).collect();
+                mem.write_slice(&bytes, GuestAddress(at)).unwrap();
+                dirty.push(MemoryRange { gpa: at, length: pages * PAGE });
+            }
+            let ranges = arker_with_busy_windows(&arker_file_ranges(&layout, &dirty), len);
+            arker_write_from_guest(&mem, &mut image, &layout, &ranges).unwrap();
+
+            let mut whole = memfd();
+            arker_write_from_guest(&mem, &mut whole, &layout, &[(0, len)]).unwrap();
+            assert!(contents(&mut image) == contents(&mut whole));
+        }
     }
 }

@@ -307,12 +307,8 @@ impl Request {
         // Queue operations expected to be submitted.
         match request_type {
             RequestType::In => {
-                for (data_addr, data_len) in &self.data_descriptors {
-                    mem.get_slice(*data_addr, *data_len as usize)
-                        .map_err(ExecuteError::GetHostAddress)?
-                        .bitmap()
-                        .mark_dirty(0, *data_len as usize);
-                }
+                self.mark_data_dirty(mem)
+                    .map_err(ExecuteError::GetHostAddress)?;
                 if disk_image.batch_requests_enabled() {
                     ret.batch_request = Some(BatchRequest {
                         offset,
@@ -514,7 +510,26 @@ impl Request {
                     .map_err(Error::GuestMemory)?;
             }
         }
+        // Marked again now the data has landed: a dirty-log read between the
+        // submission's mark and the read's completion consumed that mark, and
+        // the pages would then be missing from every later incremental image.
+        if self.request_type == RequestType::In {
+            self.mark_data_dirty(mem).map_err(Error::GuestMemory)?;
+        }
 
+        Ok(())
+    }
+
+    /// Mark the pages this request's data descriptors cover as dirty.
+    fn mark_data_dirty<B: Bitmap + 'static>(
+        &self,
+        mem: &vm_memory::GuestMemoryMmap<B>,
+    ) -> Result<(), GuestMemoryError> {
+        for (data_addr, data_len) in &self.data_descriptors {
+            mem.get_slice(*data_addr, *data_len as usize)?
+                .bitmap()
+                .mark_dirty(0, *data_len as usize);
+        }
         Ok(())
     }
 
@@ -569,5 +584,38 @@ impl Request {
             return Err(ExecuteError::BadRequest(Error::InvalidOffset));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use vm_memory::bitmap::AtomicBitmap;
+
+    use super::*;
+
+    #[test]
+    fn a_completed_read_marks_its_pages_dirty_again() {
+        let mem = vm_memory::GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(
+            GuestAddress(0),
+            0x10000,
+        )])
+        .unwrap();
+        let mut request = Request {
+            request_type: RequestType::In,
+            sector: 0,
+            data_descriptors: SmallVec::from_slice(&[(GuestAddress(0x2000), 0x1000)]),
+            status_addr: GuestAddress(0),
+            writeback: false,
+            aligned_operations: SmallVec::new(),
+            start: Instant::now(),
+        };
+        // A dirty-log read between the submission and the completion.
+        let region = mem.find_region(GuestAddress(0)).unwrap();
+        (**region).bitmap().reset();
+
+        request.complete_async(&mem).unwrap();
+
+        assert!((**region).bitmap().dirty_at(0x2000));
+        assert!(!(**region).bitmap().dirty_at(0x3000));
     }
 }
