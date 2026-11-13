@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
