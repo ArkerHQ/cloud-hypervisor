@@ -574,6 +574,9 @@ pub struct KvmVm {
     #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
     snp_guest_policy: std::sync::OnceLock<u64>,
     dirty_log_slots: RwLock<HashMap<u32, KvmDirtyLogSlot>>,
+    /// Between `start_dirty_log` and `stop_dirty_log`: a region created now is
+    /// logged from its first write.
+    dirty_log_on: AtomicBool,
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
 }
 
@@ -1088,9 +1091,12 @@ impl vm::Vm for KvmVm {
                 },
             );
 
-            // Always create guest physical memory region without `KVM_MEM_LOG_DIRTY_PAGES`.
-            // For regions that need this flag, dirty pages log will be turned on in `start_dirty_log`.
-            region.flags = self.get_kvm_userspace_memory_region_flag(0);
+            // Create guest physical memory region without `KVM_MEM_LOG_DIRTY_PAGES`
+            // unless the log is on: `start_dirty_log` turns it on for the regions
+            // that exist then, and a region created later must not go unlogged.
+            if !self.dirty_log_on.load(Ordering::Acquire) {
+                region.flags = self.get_kvm_userspace_memory_region_flag(0);
+            }
         }
 
         // SAFETY: Safe because caller promised this is safe.
@@ -1252,6 +1258,7 @@ impl vm::Vm for KvmVm {
     /// Start logging dirty pages
     ///
     fn start_dirty_log(&self) -> vm::Result<()> {
+        self.dirty_log_on.store(true, Ordering::Release);
         let dirty_log_slots = self.dirty_log_slots.read().unwrap();
         for (_, s) in dirty_log_slots.iter() {
             let region = kvm_userspace_memory_region2 {
@@ -1278,6 +1285,7 @@ impl vm::Vm for KvmVm {
     /// Stop logging dirty pages
     ///
     fn stop_dirty_log(&self) -> vm::Result<()> {
+        self.dirty_log_on.store(false, Ordering::Release);
         let dirty_log_slots = self.dirty_log_slots.read().unwrap();
         for (_, s) in dirty_log_slots.iter() {
             let region = kvm_userspace_memory_region2 {
@@ -1661,6 +1669,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 fd: Arc::new(fd),
                 msrs,
                 dirty_log_slots: RwLock::new(HashMap::new()),
+                dirty_log_on: AtomicBool::new(false),
                 #[cfg(feature = "sev_snp")]
                 sev_fd,
                 #[cfg(feature = "sev_snp")]
@@ -1674,6 +1683,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             Ok(Arc::new(KvmVm {
                 fd: Arc::new(fd),
                 dirty_log_slots: RwLock::new(HashMap::new()),
+                dirty_log_on: AtomicBool::new(false),
                 memory_slots: None,
             }))
         }

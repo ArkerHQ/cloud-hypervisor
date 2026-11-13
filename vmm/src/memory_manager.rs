@@ -3058,11 +3058,6 @@ impl MemoryManager {
         )
     }
 
-    /// The dense layout a snapshot taken now writes, and its restore reads.
-    pub fn arker_image_layout(&self) -> result::Result<MemoryRangeTable, MigratableError> {
-        self.memory_range_table(true)
-    }
-
     /// Write the file extents `file_ranges` of the image laid out as `layout`
     /// from guest memory. `fresh` starts from an empty file of the image's
     /// length; otherwise the file must already hold the rest of the image.
