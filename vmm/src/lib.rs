@@ -1831,22 +1831,13 @@ fn arker_vm_snapshot_live(
     let logged = vm
         .arker_take_logged_image()
         .filter(|logged| incremental && vm.arker_destination_holds(destination_url, logged));
-    match &logged {
-        // Write what changed since the destination's copy while the guest
-        // runs, so the pause writes only what changes meanwhile.
-        Some(logged) => {
-            let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
-            vm.arker_write_memory_since(destination_url, logged, &dirty)
-                .map_err(VmError::SnapshotSend)?;
-        }
-        None => {
-            vm.start_dirty_log().map_err(VmError::Snapshot)?;
-            if let Err(e) = vm.arker_precopy_memory(destination_url) {
-                if !keep_log {
-                    let _ = vm.stop_dirty_log();
-                }
-                return Err(VmError::SnapshotSend(e));
+    if logged.is_none() {
+        vm.start_dirty_log().map_err(VmError::Snapshot)?;
+        if let Err(e) = vm.arker_precopy_memory(destination_url) {
+            if !keep_log {
+                let _ = vm.stop_dirty_log();
             }
+            return Err(VmError::SnapshotSend(e));
         }
     }
 
