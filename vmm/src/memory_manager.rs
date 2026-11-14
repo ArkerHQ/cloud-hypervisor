@@ -4075,9 +4075,8 @@ const ARKER_WINDOW: u64 = 2 << 20;
 /// An incremental image is a reflink of the last one with the changed pages
 /// written over it, and each run written splits the shared extent under it.
 /// Captured again and again, a busy guest's image fragments until reflinking
-/// it, and every extent-tree walk on it, takes seconds: Firecracker measured a
-/// 5.5 GiB image going from 9K to 640K extents in ten captures, and the
-/// reflink from 0.1 s to 8.9 s. A window rewritten whole is one new extent.
+/// it, and every extent-tree walk on it, takes seconds. A window rewritten
+/// whole is one new extent.
 const ARKER_MAX_RUNS_PER_WINDOW: usize = 16;
 
 /// `ranges` (sorted, merged file extents) with every window that holds more
@@ -4676,6 +4675,15 @@ impl Migratable for MemoryManager {
         self.vm.start_dirty_log().map_err(|e| {
             MigratableError::MigrateSend(anyhow!("Error starting VM dirty log {e}"))
         })?;
+
+        // A log that was already on still holds every page dirtied since it
+        // was last read, and the pass after the bulk copy would write all of
+        // them again.
+        for r in &self.guest_ram_mappings {
+            self.vm.get_dirty_log(r.slot, r.gpa, r.size).map_err(|e| {
+                MigratableError::MigrateSend(anyhow!("Error clearing VM dirty log {e}"))
+            })?;
+        }
 
         for r in self.guest_memory.memory().iter() {
             (**r).bitmap().reset();
