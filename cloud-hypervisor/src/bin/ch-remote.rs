@@ -16,9 +16,7 @@ use api_client::{
     Error as ApiClientError, simple_api_command, simple_api_command_with_fds,
     simple_api_full_command,
 };
-#[cfg(feature = "dbus_api")]
-use clap::ArgAction;
-use clap::{Arg, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use log::error;
 use option_parser::{ByteSized, ByteSizedParseError};
 use thiserror::Error;
@@ -484,12 +482,12 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                 .map_err(Error::HttpApiClient)
         }
         Some("snapshot") => {
+            let snapshot_matches = matches.subcommand_matches("snapshot").unwrap();
             let snapshot_config = snapshot_config(
-                matches
-                    .subcommand_matches("snapshot")
-                    .unwrap()
+                snapshot_matches
                     .get_one::<String>("snapshot_config")
                     .unwrap(),
+                snapshot_matches.get_flag("incremental"),
             );
             simple_api_command(socket, "PUT", "snapshot", Some(&snapshot_config))
                 .map_err(Error::HttpApiClient)
@@ -707,12 +705,12 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             proxy.api_vm_add_vsock(&vsock_config)
         }
         Some("snapshot") => {
+            let snapshot_matches = matches.subcommand_matches("snapshot").unwrap();
             let snapshot_config = snapshot_config(
-                matches
-                    .subcommand_matches("snapshot")
-                    .unwrap()
+                snapshot_matches
                     .get_one::<String>("snapshot_config")
                     .unwrap(),
+                snapshot_matches.get_flag("incremental"),
             );
             proxy.api_vm_snapshot(&snapshot_config)
         }
@@ -909,9 +907,10 @@ fn add_vsock_config(config: &str) -> Result<String, Error> {
     Ok(vsock_config)
 }
 
-fn snapshot_config(url: &str) -> String {
+fn snapshot_config(url: &str, incremental: bool) -> String {
     let snapshot_config = vmm::api::VmSnapshotConfig {
         destination_url: String::from(url),
+        incremental,
     };
 
     serde_json::to_string(&snapshot_config).unwrap()
@@ -1145,6 +1144,13 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                 Arg::new("snapshot_config")
                     .index(1)
                     .help("<destination_url>"),
+            )
+            .arg(
+                Arg::new("incremental")
+                    .long("incremental")
+                    .help("The destination's memory file already holds the VM's last image")
+                    .num_args(0)
+                    .action(ArgAction::SetTrue),
             ),
     ]
     .to_vec()

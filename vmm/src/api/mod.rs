@@ -257,6 +257,11 @@ pub struct VmRemoveDeviceData {
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+    /// The destination's memory file is a copy of the image this VM's dirty
+    /// log runs from, so only the pages the log names need writing. The VMM
+    /// writes every page when its log has not run unbroken since that image.
+    #[serde(default)]
+    pub incremental: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -513,7 +518,7 @@ pub trait RequestHandler {
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_snapshot(&mut self, destination_url: &str, incremental: bool) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1634,7 +1639,7 @@ impl ApiAction for VmSnapshot {
             info!("API request event: VmSnapshot {config:?}");
 
             let response = vmm
-                .vm_snapshot(&config.destination_url)
+                .vm_snapshot(&config.destination_url, config.incremental)
                 .map_err(ApiError::VmSnapshot)
                 .map(|_| ApiResponsePayload::Empty);
 

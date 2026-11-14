@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueT};
 use vm_allocator::page_size::{align_page_size_down, get_page_size};
+use vm_memory::bitmap::Bitmap;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
     GuestMemoryError, GuestMemoryRegion,
@@ -229,7 +230,11 @@ impl BalloonEpollHandler {
             }
         }
 
-        Self::advise_memory_range(memory, range_base, len as usize, libc::MADV_DONTNEED)
+        Self::advise_memory_range(memory, range_base, len as usize, libc::MADV_DONTNEED)?;
+        // The guest now reads something else there with nothing written:
+        // an incremental snapshot must still take the range.
+        region.bitmap().mark_dirty(offset as usize, len as usize);
+        Ok(())
     }
 
     fn release_memory_range_4k(
