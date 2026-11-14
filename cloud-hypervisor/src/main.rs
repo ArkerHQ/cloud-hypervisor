@@ -470,7 +470,7 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
         // 'BUILD_VERSION' is set by the build script 'build.rs' at
         // compile time
         .author(env!("CARGO_PKG_AUTHORS"))
-        .about("Launch a cloud-hypervisor VMM.")
+        .about("Launch a cloud-hypervisor VMM (roll-test build).")
         .arg_required_else_help(true)
         .groups(groups)
         .args(args)
