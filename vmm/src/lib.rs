@@ -1826,7 +1826,11 @@ fn arker_vm_snapshot_live(
 ) -> result::Result<(), VmError> {
     let keep_log = crate::memory_manager::arker_dirty_log_mode()
         != crate::memory_manager::ArkerDirtyLog::Off;
-    let logged = vm.arker_take_logged_image().filter(|_| incremental);
+    // Decided before pausing: a save that cannot write only the changes
+    // pre-copies like any whole save instead of writing everything paused.
+    let logged = vm
+        .arker_take_logged_image()
+        .filter(|logged| incremental && vm.arker_destination_holds(destination_url, logged));
     if logged.is_none() {
         vm.start_dirty_log().map_err(VmError::Snapshot)?;
         if let Err(e) = vm.arker_precopy_memory(destination_url) {

@@ -2040,6 +2040,7 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
+            let mut restored_overlay = false;
             if memory_restore_mode == MemoryRestoreMode::OnDemand {
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
@@ -2067,6 +2068,7 @@ impl MemoryManager {
                 let mut mmg = mm.lock().unwrap();
                 match arker_overlay_base(&memory_file_path) {
                     Some(Ok(base)) => {
+                        restored_overlay = true;
                         let base_label = base.display().to_string();
                         mmg.fill_saved_regions(base, &mem_snapshot.memory_ranges)?;
                         let gm = mmg.guest_memory.memory();
@@ -2094,12 +2096,20 @@ impl MemoryManager {
                 }
             }
 
+            // An overlay restores as the base under it, while the record the
+            // next save is written over holds the overlay alone.
             if arker_dirty_log_mode() == ArkerDirtyLog::FromRestore
                 && memory_restore_mode != MemoryRestoreMode::OnDemand
+                && !restored_overlay
             {
-                mm.lock()
-                    .unwrap()
-                    .arker_arm_dirty_log(mem_snapshot.memory_ranges);
+                let mut mm = mm.lock().unwrap();
+                // Filling memory from the image marked every page in the VMM's
+                // own bitmap, and nothing else has written to it yet: those
+                // marks are the image the log runs from, not changes since.
+                for region in mm.guest_memory.memory().iter() {
+                    (**region).bitmap().reset();
+                }
+                mm.arker_arm_dirty_log(mem_snapshot.memory_ranges);
             }
 
             Ok(mm)
@@ -3115,16 +3125,25 @@ impl MemoryManager {
     ) -> result::Result<bool, MigratableError> {
         let layout = self.memory_range_table(true)?;
         let len = arker_image_len(&layout);
-        let mut path = url_to_path(destination_url)?;
-        path.push(String::from(SNAPSHOT_FILENAME));
-        let holds_image = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == len);
-        if !holds_image || !arker_same_layout(logged, &layout) {
+        if !arker_holds(&arker_image_path(destination_url)?, logged, &layout) {
             self.arker_write_image(destination_url, &layout, &[(0, len)], true)?;
             return Ok(false);
         }
         let ranges = arker_with_busy_windows(&arker_file_ranges(&layout, dirty), len);
         self.arker_write_image(destination_url, &layout, &ranges, false)?;
         Ok(true)
+    }
+
+    /// Whether the destination holds the image `logged` describes, laid out
+    /// as the guest's memory is now, so that a save may write only changes.
+    pub fn arker_destination_holds(&self, destination_url: &str, logged: &MemoryRangeTable) -> bool {
+        match (
+            self.memory_range_table(true),
+            arker_image_path(destination_url),
+        ) {
+            (Ok(layout), Ok(path)) => arker_holds(&path, logged, &layout),
+            _ => false,
+        }
     }
 
     /// Keep KVM's dirty log on from now, relative to `image`, the layout of
@@ -4052,6 +4071,19 @@ fn arker_file_ranges(layout: &MemoryRangeTable, ranges: &MemoryRangeTable) -> Ve
         cursor += region.length;
     }
     arker_merge(out)
+}
+
+fn arker_image_path(destination_url: &str) -> result::Result<PathBuf, MigratableError> {
+    let mut path = url_to_path(destination_url)?;
+    path.push(String::from(SNAPSHOT_FILENAME));
+    Ok(path)
+}
+
+/// Whether `path` holds an image of the memory `logged` describes, for memory
+/// laid out as `layout`.
+fn arker_holds(path: &Path, logged: &MemoryRangeTable, layout: &MemoryRangeTable) -> bool {
+    arker_same_layout(logged, layout)
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == arker_image_len(layout))
 }
 
 fn arker_merge(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
@@ -5072,6 +5104,23 @@ mod arker_incremental_tests {
             dirty_log_mode(Some("from-restore")),
             ArkerDirtyLog::FromRestore
         );
+    }
+
+    /// Only a file of the image's length, written for the same layout, may
+    /// take just the changes.
+    #[test]
+    fn a_destination_holds_the_image_only_at_its_length_and_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SNAPSHOT_FILENAME);
+        let layout = table(&[(0, 8 * PAGE), (1 << 32, 4 * PAGE)]);
+        assert!(!arker_holds(&path, &layout, &layout), "a missing file");
+        let file = File::create(&path).unwrap();
+        file.set_len(arker_image_len(&layout) - PAGE).unwrap();
+        assert!(!arker_holds(&path, &layout, &layout), "a short file");
+        file.set_len(arker_image_len(&layout)).unwrap();
+        assert!(arker_holds(&path, &layout, &layout));
+        let plugged = table(&[(0, 8 * PAGE), (1 << 32, 2 * PAGE), (2 << 32, 2 * PAGE)]);
+        assert!(!arker_holds(&path, &plugged, &layout), "a layout since changed");
     }
 
     #[test]

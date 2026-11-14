@@ -3102,6 +3102,16 @@ impl Vm {
             .arker_take_logged_image()
     }
 
+    /// ARKER: whether the destination holds the image `logged` describes,
+    /// laid out as the guest's memory is now
+    /// (`MemoryManager::arker_destination_holds`).
+    pub fn arker_destination_holds(&self, destination_url: &str, logged: &MemoryRangeTable) -> bool {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .arker_destination_holds(destination_url, logged)
+    }
+
     /// The snapshot just taken is the image the dirty log runs from.
     pub fn arker_log_from_snapshot(&self) {
         self.memory_manager.lock().unwrap().arker_log_from_snapshot()
