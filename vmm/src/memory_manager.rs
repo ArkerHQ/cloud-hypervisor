@@ -3136,7 +3136,11 @@ impl MemoryManager {
 
     /// Whether the destination holds the image `logged` describes, laid out
     /// as the guest's memory is now, so that a save may write only changes.
-    pub fn arker_destination_holds(&self, destination_url: &str, logged: &MemoryRangeTable) -> bool {
+    pub fn arker_destination_holds(
+        &self,
+        destination_url: &str,
+        logged: &MemoryRangeTable,
+    ) -> bool {
         match (
             self.memory_range_table(true),
             arker_image_path(destination_url),
@@ -5120,7 +5124,10 @@ mod arker_incremental_tests {
         file.set_len(arker_image_len(&layout)).unwrap();
         assert!(arker_holds(&path, &layout, &layout));
         let plugged = table(&[(0, 8 * PAGE), (1 << 32, 2 * PAGE), (2 << 32, 2 * PAGE)]);
-        assert!(!arker_holds(&path, &plugged, &layout), "a layout since changed");
+        assert!(
+            !arker_holds(&path, &plugged, &layout),
+            "a layout since changed"
+        );
     }
 
     #[test]

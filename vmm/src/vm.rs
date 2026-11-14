@@ -3105,7 +3105,11 @@ impl Vm {
     /// ARKER: whether the destination holds the image `logged` describes,
     /// laid out as the guest's memory is now
     /// (`MemoryManager::arker_destination_holds`).
-    pub fn arker_destination_holds(&self, destination_url: &str, logged: &MemoryRangeTable) -> bool {
+    pub fn arker_destination_holds(
+        &self,
+        destination_url: &str,
+        logged: &MemoryRangeTable,
+    ) -> bool {
         self.memory_manager
             .lock()
             .unwrap()
