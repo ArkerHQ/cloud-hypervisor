@@ -3075,8 +3075,7 @@ impl MemoryManager {
         if layout.is_empty() {
             return Ok(());
         }
-        let mut memory_file_path = url_to_path(destination_url)?;
-        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+        let memory_file_path = arker_image_path(destination_url)?;
         let mut memory_file = OpenOptions::new()
             .read(true)
             .write(true)
