@@ -2040,7 +2040,7 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            let mut restored_overlay = false;
+            let restored_overlay = arker_overlay_base(&memory_file_path).is_some();
             if memory_restore_mode == MemoryRestoreMode::OnDemand {
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
@@ -2068,7 +2068,6 @@ impl MemoryManager {
                 let mut mmg = mm.lock().unwrap();
                 match arker_overlay_base(&memory_file_path) {
                     Some(Ok(base)) => {
-                        restored_overlay = true;
                         let base_label = base.display().to_string();
                         mmg.fill_saved_regions(base, &mem_snapshot.memory_ranges)?;
                         let gm = mmg.guest_memory.memory();
@@ -2102,14 +2101,9 @@ impl MemoryManager {
                 && memory_restore_mode != MemoryRestoreMode::OnDemand
                 && !restored_overlay
             {
-                let mut mm = mm.lock().unwrap();
-                // Filling memory from the image marked every page in the VMM's
-                // own bitmap, and nothing else has written to it yet: those
-                // marks are the image the log runs from, not changes since.
-                for region in mm.guest_memory.memory().iter() {
-                    (**region).bitmap().reset();
-                }
-                mm.arker_arm_dirty_log(mem_snapshot.memory_ranges);
+                mm.lock()
+                    .unwrap()
+                    .arker_arm_dirty_log(mem_snapshot.memory_ranges);
             }
 
             Ok(mm)
@@ -3134,27 +3128,14 @@ impl MemoryManager {
         Ok(true)
     }
 
-    /// Whether the destination holds the image `logged` describes, laid out
-    /// as the guest's memory is now, so that a save may write only changes.
-    pub fn arker_destination_holds(
-        &self,
-        destination_url: &str,
-        logged: &MemoryRangeTable,
-    ) -> bool {
-        match (
-            self.memory_range_table(true),
-            arker_image_path(destination_url),
-        ) {
-            (Ok(layout), Ok(path)) => arker_holds(&path, logged, &layout),
-            _ => false,
-        }
-    }
-
-    /// Keep KVM's dirty log on from now, relative to `image`, the layout of
-    /// the memory the guest holds. Only KVM's half is armed: the VMM's own
-    /// bitmap has tracked every write it made since this process began, and
-    /// resetting it here would drop a device's write made before arming.
+    /// Keep the dirty log on from the restore of `image`, the layout of the
+    /// memory the guest holds. Called before any device exists, so the only
+    /// marks in the VMM's own bitmap are the restore's fill of that image,
+    /// which are not changes since it.
     pub fn arker_arm_dirty_log(&mut self, image: MemoryRangeTable) {
+        for region in self.guest_memory.memory().iter() {
+            (**region).bitmap().reset();
+        }
         match self.vm.start_dirty_log() {
             Ok(()) => self.arker_logged_image = Some(image),
             Err(e) => arker_delta_report(&format!(
