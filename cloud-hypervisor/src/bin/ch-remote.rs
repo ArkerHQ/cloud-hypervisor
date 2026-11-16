@@ -1141,16 +1141,16 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
         Command::new("snapshot")
             .about("Create a snapshot from VM")
             .arg(
-                Arg::new("snapshot_config")
-                    .index(1)
-                    .help("<destination_url>"),
-            )
-            .arg(
                 Arg::new("incremental")
                     .long("incremental")
                     .help("The destination's memory file already holds the VM's last image")
                     .num_args(0)
                     .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("snapshot_config")
+                    .index(1)
+                    .help("<destination_url>"),
             ),
     ]
     .to_vec()
