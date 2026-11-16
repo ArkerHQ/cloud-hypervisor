@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_memory::bitmap::Bitmap;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
     GuestMemoryError, GuestMemoryLoadGuard, GuestMemoryRegion,
@@ -474,6 +475,10 @@ impl MemEpollHandler {
                 return Err(Error::DiscardMemoryRange(err));
             }
         }
+
+        // The guest now reads something else there with nothing written: an
+        // incremental snapshot must still take the range.
+        self.region.bitmap().mark_dirty(offset as usize, size as usize);
 
         Ok(())
     }

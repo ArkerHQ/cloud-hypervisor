@@ -3093,6 +3093,35 @@ impl Vm {
             .arker_write_ranges(destination_url, table, false)
     }
 
+    /// The layout of the image the dirty log runs from, leaving none until a
+    /// snapshot succeeds (`MemoryManager::arker_take_logged_image`).
+    pub fn arker_take_logged_image(&self) -> Option<MemoryRangeTable> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .arker_take_logged_image()
+    }
+
+    /// The snapshot just taken is the image the dirty log runs from.
+    pub fn arker_log_from_snapshot(&self) {
+        self.memory_manager.lock().unwrap().arker_log_from_snapshot()
+    }
+
+    /// ARKER: write the memory image from the dirty log over the copy of the
+    /// image `logged` describes, or whole when the destination does not hold
+    /// it (`MemoryManager::arker_write_since`).
+    pub fn arker_write_memory_since(
+        &self,
+        destination_url: &str,
+        logged: &MemoryRangeTable,
+        dirty: &MemoryRangeTable,
+    ) -> std::result::Result<bool, MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .arker_write_since(destination_url, logged, dirty)
+    }
+
     /// ARKER LIVE: write the config and device/vCPU state, WITHOUT the memory.
     ///
     /// `Transportable::send` writes all three and ends by calling

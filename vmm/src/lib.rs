@@ -1793,7 +1793,8 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
     Ok(())
 }
 
-/// The two-pass capture. Ordering here is the whole correctness argument:
+/// The capture. A full one is two passes, and their ordering is the whole
+/// correctness argument:
 ///
 ///   1. `start_dirty_log` FIRST, so nothing the pre-copy races is missed.
 ///      Arming after would lose every page dirtied in between.
@@ -1806,16 +1807,34 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
 ///   6. device + vCPU state, which requires the pause.
 ///   7. resume. Downtime ends.
 ///
-/// The guest is stopped for 4-6 only: the dirty delta, not 8 GiB.
+/// An incremental one (`incremental`, with the log unbroken since the image
+/// the destination holds a copy of) skips 1-2: the log already names every
+/// page changed since that image, so 4-5 write only those. Its writes go in
+/// with the guest paused, so a device write marked dirty before landing
+/// cannot land between the log read and the write.
+///
+/// With `ARKER_CH_DIRTY_LOG` set the log stays on afterwards, so the next
+/// capture can be incremental; only a capture that succeeds re-establishes it.
 ///
 /// Resume is best-effort on the failure paths deliberately. A capture that
 /// fails has already cost the caller its snapshot; leaving the guest paused
 /// on the way out would cost it the VM as well.
-fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<(), VmError> {
-    vm.start_dirty_log().map_err(VmError::Snapshot)?;
-    if let Err(e) = vm.arker_precopy_memory(destination_url) {
-        let _ = vm.stop_dirty_log();
-        return Err(VmError::SnapshotSend(e));
+fn arker_vm_snapshot_live(
+    vm: &mut Vm,
+    destination_url: &str,
+    incremental: bool,
+) -> result::Result<(), VmError> {
+    let keep_log = crate::memory_manager::arker_dirty_log_mode()
+        != crate::memory_manager::ArkerDirtyLog::Off;
+    let logged = vm.arker_take_logged_image().filter(|_| incremental);
+    if logged.is_none() {
+        vm.start_dirty_log().map_err(VmError::Snapshot)?;
+        if let Err(e) = vm.arker_precopy_memory(destination_url) {
+            if !keep_log {
+                let _ = vm.stop_dirty_log();
+            }
+            return Err(VmError::SnapshotSend(e));
+        }
     }
 
     // The caller may ALREADY have paused this VM, and that is not an error.
@@ -1845,13 +1864,29 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
     }
     let result = (|| {
         let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
-        vm.arker_write_dirty_memory(destination_url, &dirty)
-            .map_err(VmError::SnapshotSend)?;
+        match &logged {
+            Some(logged) => {
+                let since = vm
+                    .arker_write_memory_since(destination_url, logged, &dirty)
+                    .map_err(VmError::SnapshotSend)?;
+                crate::memory_manager::arker_delta_report(&format!(
+                    "CHLOG save: pid={} incremental={since}",
+                    std::process::id()
+                ));
+            }
+            None => vm
+                .arker_write_dirty_memory(destination_url, &dirty)
+                .map_err(VmError::SnapshotSend)?,
+        }
         let snapshot = vm.snapshot().map_err(VmError::Snapshot)?;
         vm.arker_send_state_only(&snapshot, destination_url)
             .map_err(VmError::SnapshotSend)
     })();
-    let _ = vm.stop_dirty_log();
+    if !keep_log {
+        let _ = vm.stop_dirty_log();
+    } else if result.is_ok() {
+        vm.arker_log_from_snapshot();
+    }
     // Symmetric with the pause above: a VM the caller handed us paused stays
     // paused.
     let resumed = if already_paused {
@@ -1985,7 +2020,11 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(
+        &mut self,
+        destination_url: &str,
+        incremental: bool,
+    ) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
@@ -2022,7 +2061,7 @@ impl RequestHandler for Vmm {
             // fallback would rot untested until the day it ran. `Vm::send` and
             // `MemoryManager::send` still exist to satisfy `Transportable`, but
             // nothing on the snapshot path calls them any more.
-            arker_vm_snapshot_live(vm, destination_url)
+            arker_vm_snapshot_live(vm, destination_url, incremental)
         } else {
             Err(VmError::VmNotRunning)
         }
