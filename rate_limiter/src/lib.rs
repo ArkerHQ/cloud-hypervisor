@@ -920,4 +920,122 @@ pub(crate) mod unit_tests {
             ),
         );
     }
+
+    fn live_config(size: u64, burst: u64) -> BucketConfig {
+        BucketConfig { size, one_time_burst: burst, refill_time: 1_000_000 }
+    }
+
+    #[test]
+    fn live_same_target_preserves_consumed_credit_and_block() {
+        let limiter = RateLimiter::new(100, 1000, 1_000_000, 0, 0, 0).unwrap();
+        assert!(limiter.consume_managed(1101, TokenType::Bytes));
+        let before = limiter.managed_state();
+        let bucket = limiter.inner.lock().unwrap().bandwidth.clone();
+        assert!(before.blocked);
+        assert_eq!(before.bandwidth.debt, 1);
+        for _ in 0..20 {
+            assert!(!limiter.update_bandwidth(Some(live_config(100, 1000))).unwrap());
+        }
+        assert_eq!(limiter.managed_state(), before);
+        assert_eq!(limiter.inner.lock().unwrap().bandwidth, bucket);
+    }
+
+    #[test]
+    fn live_completed_packets_charge_bytes_and_ops_even_while_blocked() {
+        let limiter = RateLimiter::new(100, 0, 1_000_000, 1, 0, 1_000_000).unwrap();
+        limiter.account_transferred(200, 2).unwrap();
+        assert!(limiter.is_blocked());
+        limiter.account_transferred(200, 2).unwrap();
+        let state = limiter.managed_state();
+        assert_eq!(state.bandwidth.debt, 300);
+        assert_eq!(state.ops.debt, 3);
+        assert_eq!(state.bandwidth.budget, 0);
+    }
+
+    #[test]
+    fn live_real_rate_changes_do_not_erase_debt_or_renew_burst() {
+        let limiter = RateLimiter::new(100, 1000, 1_000_000, 0, 0, 0).unwrap();
+        limiter.account_transferred(1200, 1).unwrap();
+        for size in [200, 50, 300, 100] {
+            assert!(limiter.update_bandwidth(Some(live_config(size, size * 10))).unwrap());
+            let state = limiter.managed_state();
+            assert_eq!(state.bandwidth.burst, 0);
+            assert_eq!(state.bandwidth.budget, 0);
+            assert_eq!(state.bandwidth.debt, 100);
+            assert!(state.blocked);
+        }
+    }
+
+    #[test]
+    fn live_disable_reenable_retains_debt_without_another_initial_burst() {
+        let limiter = RateLimiter::new(100, 1000, 1_000_000, 0, 0, 0).unwrap();
+        limiter.account_transferred(1200, 1).unwrap();
+        assert!(limiter.update_bandwidth(None).unwrap());
+        assert!(!limiter.is_blocked());
+        assert_eq!(limiter.managed_state().bandwidth.configured, None);
+        assert!(limiter.update_bandwidth(Some(live_config(200, 2000))).unwrap());
+        let state = limiter.managed_state();
+        assert_eq!(state.bandwidth.burst, 0);
+        assert_eq!(state.bandwidth.debt, 100);
+        assert!(state.blocked);
+    }
+
+    #[test]
+    fn live_first_finite_policy_gets_one_initial_burst() {
+        let limiter = RateLimiter::default();
+        assert!(!limiter.update_bandwidth(None).unwrap());
+        assert!(limiter.update_bandwidth(Some(live_config(100, 1000))).unwrap());
+        assert_eq!(limiter.managed_state().bandwidth.burst, 1000);
+        assert!(limiter.update_bandwidth(None).unwrap());
+        assert!(limiter.update_bandwidth(Some(live_config(100, 1000))).unwrap());
+        assert_eq!(limiter.managed_state().bandwidth.burst, 0);
+    }
+
+    #[test]
+    fn live_bandwidth_change_preserves_an_ops_induced_block() {
+        let limiter = RateLimiter::new(100, 0, 1_000_000, 1, 0, 1_000_000).unwrap();
+        limiter.account_transferred(0, 10).unwrap();
+        assert!(limiter.update_bandwidth(None).unwrap());
+        let state = limiter.managed_state();
+        assert_eq!(state.ops.debt, 9);
+        assert!(state.blocked);
+    }
+
+    #[test]
+    fn live_invalid_finite_policy_does_not_mutate_either_bucket() {
+        let limiter = RateLimiter::new(100, 0, 1000, 1, 0, 1000).unwrap();
+        let before = limiter.managed_state();
+        for config in [
+            BucketConfig { size: 0, one_time_burst: 0, refill_time: 1000 },
+            BucketConfig { size: 1, one_time_burst: 0, refill_time: 0 },
+            BucketConfig { size: 1, one_time_burst: 0, refill_time: u64::MAX },
+        ] {
+            assert!(limiter.update_bandwidth(Some(config)).is_err());
+            assert_eq!(limiter.managed_state(), before);
+        }
+    }
+
+    #[test]
+    fn live_elapsed_repayment_is_translated_before_a_rate_change() {
+        let mut bucket = TokenBucket::new(100, 0, 1000).unwrap();
+        let start = bucket.last_update;
+        bucket.budget = 0;
+        bucket.debt = 200 * TOKEN_SCALE;
+        bucket.settle_at(start + Duration::from_secs(1));
+        assert_eq!(bucket.debt, 100 * TOKEN_SCALE);
+        bucket.size = 200;
+        bucket.settle_at(start + Duration::from_millis(1500));
+        assert_eq!(bucket.debt, 0);
+        assert_eq!(bucket.budget, 0);
+        bucket.settle_at(start + Duration::from_secs(2));
+        assert_eq!(bucket.budget, 100);
+    }
+
+    #[test]
+    fn live_stale_timer_readiness_is_benign_without_changing_local_behavior() {
+        let limiter = RateLimiter::default();
+        assert!(!limiter.managed_event_handler().unwrap());
+        assert!(limiter.event_handler().is_err());
+    }
+
 }
