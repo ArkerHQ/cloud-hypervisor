@@ -591,3 +591,50 @@ impl NetQueuePair {
             .map_err(NetQueuePairError::QueueNeedsNotification)
     }
 }
+
+#[cfg(test)]
+mod live_rate_tests {
+    use super::NetRateLimiter;
+    use rate_limiter::RateLimiter;
+    use rate_limiter::group::RateLimiterGroup;
+
+    #[test]
+    fn completed_packets_always_charge_both_group_axes() {
+        let group =
+            RateLimiterGroup::new("actual-nic-rx", 100, 0, 1_000_000, 1, 0, 1_000_000).unwrap();
+        let first = NetRateLimiter::Group(group.new_handle().unwrap());
+        let second = NetRateLimiter::Group(group.new_handle().unwrap());
+        assert!(first.account_tap_result(20).unwrap());
+        assert!(!second.account_tap_result(30).unwrap());
+        assert!(first.group_blocked());
+        assert!(!first.account_tap_result(150).unwrap());
+        let state = group.state();
+        assert_eq!(state.bandwidth.debt, 100);
+        assert_eq!(state.ops.debt, 2);
+    }
+
+    #[test]
+    fn tap_failures_and_empty_transfers_charge_nothing() {
+        let group =
+            RateLimiterGroup::new("actual-nic-tx", 100, 0, 1_000_000, 1, 0, 1_000_000).unwrap();
+        let limiter = NetRateLimiter::Group(group.new_handle().unwrap());
+        let before = group.state();
+        for result in [-1, 0] {
+            assert!(limiter.account_tap_result(result).unwrap());
+            assert_eq!(group.state(), before);
+        }
+        limiter.account_tap_result(7).unwrap();
+        assert_eq!(group.state().bandwidth.budget, 93);
+        assert_eq!(group.state().ops.budget, 0);
+    }
+
+    #[test]
+    fn local_mode_keeps_legacy_post_transfer_accounting() {
+        let limiter =
+            NetRateLimiter::Local(RateLimiter::new(100, 0, 1_000_000, 1, 0, 1_000_000).unwrap());
+        assert!(limiter.account_tap_result(200).unwrap());
+        assert!(!limiter.group_blocked());
+        assert!(limiter.account_legacy(200));
+        assert!(limiter.is_blocked());
+    }
+}
