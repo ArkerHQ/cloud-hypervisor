@@ -413,7 +413,7 @@ mod live_rate_config_tests {
             serde_json::json!({"rx": {}, "tx": {"bandwidth": {"size": 200, "refill_time": 1000}}});
         let decoded: NetRateLimiterConfig = serde_json::from_value(aggregate.clone()).unwrap();
         assert!(matches!(decoded, NetRateLimiterConfig::Aggregate { .. }));
-        assert!(serde_json::from_value::<RateLimiterConfig>(aggregate).is_err());
+        serde_json::from_value::<RateLimiterConfig>(aggregate).unwrap_err();
         let saved = serde_json::to_value(decoded).unwrap();
         assert!(saved.get("rx").is_some());
         assert!(saved.get("tx").is_some());
@@ -432,7 +432,7 @@ mod live_rate_config_tests {
             serde_json::json!({"rx": {}, "tx": {}, "bandwidth": {}}),
             serde_json::json!({"rx": {}, "tx": {}, "typo": true}),
         ] {
-            assert!(serde_json::from_value::<NetRateLimiterConfig>(value).is_err());
+            serde_json::from_value::<NetRateLimiterConfig>(value).unwrap_err();
         }
     }
 }

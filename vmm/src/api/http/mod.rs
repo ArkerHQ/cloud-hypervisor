@@ -234,6 +234,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     );
     r.routes.insert(endpoint!("/vm.info"), Box::new(VmInfo {}));
     r.routes.insert(
+        endpoint!("/vm.rate-limits"),
+        Box::new(http_endpoint::VmRateLimits),
+    );
+    r.routes.insert(
         endpoint!("/vm.pause"),
         Box::new(VmActionHandler::new(&VmPause)),
     );

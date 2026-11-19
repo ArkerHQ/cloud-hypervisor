@@ -1869,6 +1869,17 @@ fn arker_vm_snapshot_live(vm: &mut Vm, destination_url: &str) -> result::Result<
 }
 
 impl RequestHandler for Vmm {
+    fn vm_rate_limits(
+        &mut self,
+        update: Option<api::VmRateLimitsRequest>,
+    ) -> result::Result<Option<Vec<u8>>, VmError> {
+        let vm = self.vm.as_mut().ok_or(VmError::VmNotRunning)?;
+        let response = vm.rate_limits(update)?;
+        serde_json::to_vec(&response)
+            .map(Some)
+            .map_err(VmError::SerializeJson)
+    }
+
     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
         // The VM will be created when being asked to boot it.

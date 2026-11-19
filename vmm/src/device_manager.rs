@@ -111,6 +111,7 @@ use vm_migration::{
 use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::api::{VmRateLimitsRequest, VmRateLimitsResponse, VmRateLimitsState};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
@@ -165,6 +166,14 @@ const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
 /// Errors associated with device manager
 #[derive(Error, Debug)]
 pub enum DeviceManagerError {
+    #[error("Invalid rate target or patch: {0}")]
+    RateLimitsInvalid(String),
+    #[error("Rate target {id} is unsupported: {reason}")]
+    RateLimitsUnsupported { id: String, reason: &'static str },
+    #[error("Disk {id} belongs to shared group {group_id}; update that group explicitly")]
+    RateLimitsSharedGroup { id: String, group_id: String },
+    #[error("Failed to update attached rate group")]
+    RateLimitsUpdate(#[source] rate_limiter::group::Error),
     /// Cannot create EventFd.
     #[error("Cannot create EventFd")]
     EventFd(#[source] io::Error),
@@ -931,7 +940,14 @@ pub enum PciDeviceHandle {
 }
 
 #[derive(Clone)]
+enum RateControl {
+    Block(Arc<Mutex<virtio_devices::Block>>),
+    Net(Arc<Mutex<virtio_devices::Net>>),
+}
+
+#[derive(Clone)]
 struct MetaVirtioDevice {
+    rate_control: Option<RateControl>,
     virtio_device: Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
     pci_common: PciDeviceCommonConfig,
     dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
@@ -1196,6 +1212,37 @@ fn use_64bit_bar_for_virtio_device(
     is_hotplug: bool,
 ) -> bool {
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
+}
+
+fn rate_group_config(group: &RateLimiterGroup) -> virtio_devices::RateLimiterConfig {
+    fn bucket(
+        config: Option<rate_limiter::BucketConfig>,
+    ) -> Option<virtio_devices::TokenBucketConfig> {
+        config.map(|config| virtio_devices::TokenBucketConfig {
+            size: config.size,
+            one_time_burst: Some(config.one_time_burst),
+            refill_time: config.refill_time,
+        })
+    }
+    let state = group.state();
+    virtio_devices::RateLimiterConfig {
+        bandwidth: bucket(state.bandwidth.configured),
+        ops: bucket(state.ops.configured),
+    }
+}
+
+fn persisted_named_rate_config(
+    mut config: virtio_devices::RateLimiterConfig,
+) -> virtio_devices::RateLimiterConfig {
+    if config.bandwidth.is_none() && config.ops.is_none() {
+        // Existing named-group validation requires a present bucket.
+        config.bandwidth = Some(virtio_devices::TokenBucketConfig {
+            size: 0,
+            one_time_burst: Some(0),
+            refill_time: 1000,
+        });
+    }
+    config
 }
 
 impl DeviceManager {
@@ -2463,6 +2510,7 @@ impl DeviceManager {
         .map_err(DeviceManagerError::CreateVirtioConsole)?;
         let virtio_console_device = Arc::new(Mutex::new(virtio_console_device));
         self.virtio_devices.push(MetaVirtioDevice {
+            rate_control: None,
             virtio_device: Arc::clone(&virtio_console_device)
                 as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
             pci_common: console_config.pci_common.clone(),
@@ -2675,6 +2723,7 @@ impl DeviceManager {
 
         info!("Creating virtio-block device: {disk_cfg:?}");
 
+        let mut rate_control = None;
         let (virtio_device, migratable_device) = if disk_cfg.vhost_user {
             if is_hotplug {
                 debug!("Acquiring image lock for vhost-user block device not supported");
@@ -2831,6 +2880,7 @@ impl DeviceManager {
 
             self.block_devices.push(virtio_block.clone());
 
+            rate_control = Some(RateControl::Block(virtio_block.clone()));
             (
                 Arc::clone(&virtio_block) as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                 virtio_block as Arc<Mutex<dyn Migratable>>,
@@ -2846,6 +2896,7 @@ impl DeviceManager {
             .insert(id.clone(), device_node!(id, migratable_device));
 
         Ok(MetaVirtioDevice {
+            rate_control,
             virtio_device,
             pci_common: disk_cfg.pci_common.clone(),
             dma_handler: None,
@@ -2879,6 +2930,7 @@ impl DeviceManager {
         };
         info!("Creating virtio-net device: {net_cfg:?}");
 
+        let mut rate_control = None;
         let (virtio_device, migratable_device) = if net_cfg.vhost_user {
             let socket = net_cfg.vhost_socket.as_ref().unwrap().clone();
             let vu_cfg = VhostUserConfig {
@@ -3000,6 +3052,7 @@ impl DeviceManager {
                 ))
             };
 
+            rate_control = Some(RateControl::Net(virtio_net.clone()));
             (
                 Arc::clone(&virtio_net) as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                 virtio_net as Arc<Mutex<dyn Migratable>>,
@@ -3015,6 +3068,7 @@ impl DeviceManager {
             .insert(id.clone(), device_node!(id, migratable_device));
 
         Ok(MetaVirtioDevice {
+            rate_control,
             virtio_device,
             pci_common: net_cfg.pci_common.clone(),
             dma_handler: None,
@@ -3065,6 +3119,7 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::CreateVirtioRng)?,
             ));
             self.virtio_devices.push(MetaVirtioDevice {
+                rate_control: None,
                 virtio_device: Arc::clone(&virtio_rng_device)
                     as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                 pci_common: rng_config.pci_common.clone(),
@@ -3125,6 +3180,7 @@ impl DeviceManager {
             self.device_tree.lock().unwrap().insert(id.clone(), node);
 
             Ok(MetaVirtioDevice {
+                rate_control: None,
                 virtio_device: Arc::clone(&generic_vhost_user_device)
                     as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                 pci_common: generic_vhost_user_cfg.pci_common.clone(),
@@ -3190,6 +3246,7 @@ impl DeviceManager {
             self.device_tree.lock().unwrap().insert(id.clone(), node);
 
             Ok(MetaVirtioDevice {
+                rate_control: None,
                 virtio_device: Arc::clone(&virtio_fs_device)
                     as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                 pci_common: fs_cfg.pci_common.clone(),
@@ -3378,6 +3435,7 @@ impl DeviceManager {
         self.device_tree.lock().unwrap().insert(id.clone(), node);
 
         Ok(MetaVirtioDevice {
+            rate_control: None,
             virtio_device: Arc::clone(&virtio_pmem_device)
                 as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
             pci_common: pmem_cfg.pci_common.clone(),
@@ -3448,6 +3506,7 @@ impl DeviceManager {
             .insert(id.clone(), device_node!(id, vsock_device));
 
         Ok(MetaVirtioDevice {
+            rate_control: None,
             virtio_device: Arc::clone(&vsock_device)
                 as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
             pci_common: vsock_cfg.pci_common.clone(),
@@ -3502,6 +3561,7 @@ impl DeviceManager {
                 self.virtio_mem_devices.push(Arc::clone(&virtio_mem_device));
 
                 self.virtio_devices.push(MetaVirtioDevice {
+                    rate_control: None,
                     virtio_device: Arc::clone(&virtio_mem_device)
                         as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                     pci_common: PciDeviceCommonConfig {
@@ -3591,6 +3651,7 @@ impl DeviceManager {
             self.balloon = Some(virtio_balloon_device.clone());
 
             self.virtio_devices.push(MetaVirtioDevice {
+                rate_control: None,
                 virtio_device: Arc::clone(&virtio_balloon_device)
                     as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
                 pci_common: PciDeviceCommonConfig {
@@ -3631,6 +3692,7 @@ impl DeviceManager {
             .map_err(DeviceManagerError::CreateVirtioWatchdog)?,
         ));
         self.virtio_devices.push(MetaVirtioDevice {
+            rate_control: None,
             virtio_device: Arc::clone(&virtio_watchdog_device)
                 as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
             pci_common: PciDeviceCommonConfig {
@@ -3692,6 +3754,7 @@ impl DeviceManager {
             .insert(id.clone(), device_node!(id, vdpa_device));
 
         Ok(MetaVirtioDevice {
+            rate_control: None,
             virtio_device: vdpa_device as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
             pci_common: vdpa_cfg.pci_common.clone(),
             dma_handler: Some(vdpa_mapping),
@@ -5109,6 +5172,249 @@ impl DeviceManager {
         self.hotplug_virtio_pci_device(device)
     }
 
+    fn named_rate_group(&self, group: &Arc<RateLimiterGroup>) -> Option<String> {
+        self.rate_limit_groups
+            .iter()
+            .find_map(|(id, candidate)| Arc::ptr_eq(group, candidate).then(|| id.clone()))
+    }
+
+    fn rate_group_members(&self, group: &Arc<RateLimiterGroup>) -> Vec<String> {
+        let mut members: Vec<_> = self
+            .virtio_devices
+            .iter()
+            .filter_map(|device| {
+                let Some(RateControl::Block(block)) = &device.rate_control else {
+                    return None;
+                };
+                block
+                    .lock()
+                    .unwrap()
+                    .rate_limiter_group()
+                    .filter(|candidate| Arc::ptr_eq(candidate, group))
+                    .map(|_| device.id().to_owned())
+            })
+            .collect();
+        members.sort();
+        members
+    }
+
+    fn device_rate_state(&self, device: &MetaVirtioDevice) -> Option<VmRateLimitsState> {
+        let id = device.id().to_owned();
+        match &device.rate_control {
+            Some(RateControl::Block(block)) => {
+                let block = block.lock().unwrap();
+                let (queues, active) = block.rate_queue_counts();
+                let group = block.rate_limiter_group()?;
+                Some(VmRateLimitsState::Disk {
+                    id,
+                    group_id: self.named_rate_group(&group),
+                    queues,
+                    active_queues: Some(active),
+                    limiter: Some(group.state().into()),
+                    unsupported_reason: None,
+                })
+            }
+            Some(RateControl::Net(net)) => {
+                let net = net.lock().unwrap();
+                let (queue_pairs, active) = net.rate_queue_pair_counts();
+                let groups = net.rate_limiter_groups();
+                Some(VmRateLimitsState::Net {
+                    id,
+                    queue_pairs,
+                    active_queue_pairs: Some(active),
+                    rx: groups.as_ref().map(|groups| groups.rx.state().into()),
+                    tx: groups.as_ref().map(|groups| groups.tx.state().into()),
+                    unsupported_reason: groups
+                        .is_none()
+                        .then(|| "legacy_per_queue_config".to_owned()),
+                })
+            }
+            None => {
+                let device = device.virtio_device.lock().unwrap();
+                match VirtioDeviceType::from(device.device_type()) {
+                    VirtioDeviceType::Block => Some(VmRateLimitsState::Disk {
+                        id,
+                        group_id: None,
+                        queues: device.queue_max_sizes().len(),
+                        active_queues: None,
+                        limiter: None,
+                        unsupported_reason: Some("external_backend".to_owned()),
+                    }),
+                    VirtioDeviceType::Net => Some(VmRateLimitsState::Net {
+                        id,
+                        queue_pairs: device.queue_max_sizes().len() / 2,
+                        active_queue_pairs: None,
+                        rx: None,
+                        tx: None,
+                        unsupported_reason: Some("external_backend".to_owned()),
+                    }),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn apply_rate_update(&self, update: &VmRateLimitsRequest) -> DeviceManagerResult<()> {
+        update
+            .validate()
+            .map_err(|error| DeviceManagerError::RateLimitsInvalid(error.to_string()))?;
+        let id = update.id();
+        if let VmRateLimitsRequest::BlockGroup { bandwidth, .. } = update {
+            let group = self.rate_limit_groups.get(id).ok_or_else(|| {
+                DeviceManagerError::RateLimitsInvalid(format!("block_group {id} not found"))
+            })?;
+            let mut config = self.config.lock().unwrap();
+            let saved = config
+                .rate_limit_groups
+                .as_mut()
+                .and_then(|groups| groups.iter_mut().find(|group| group.id == id))
+                .ok_or_else(|| {
+                    DeviceManagerError::RateLimitsInvalid(format!(
+                        "block_group {id} has no saved config"
+                    ))
+                })?;
+            let before = rate_group_config(group);
+            let result = bandwidth.apply(group);
+            let after = rate_group_config(group);
+            if before != after {
+                saved.rate_limiter_config = persisted_named_rate_config(after);
+            }
+            return result
+                .map(|_| ())
+                .map_err(DeviceManagerError::RateLimitsUpdate);
+        }
+        let device = self
+            .virtio_devices
+            .iter()
+            .find(|device| device.id() == id)
+            .ok_or_else(|| {
+                DeviceManagerError::RateLimitsInvalid(format!("device {id} not found"))
+            })?;
+        match (update, &device.rate_control) {
+            (VmRateLimitsRequest::Disk { bandwidth, .. }, Some(RateControl::Block(block))) => {
+                let group = block.lock().unwrap().rate_limiter_group().ok_or_else(|| {
+                    DeviceManagerError::RateLimitsUnsupported {
+                        id: id.to_owned(),
+                        reason: "missing_consumer_group",
+                    }
+                })?;
+                if let Some(group_id) = self.named_rate_group(&group) {
+                    return Err(DeviceManagerError::RateLimitsSharedGroup {
+                        id: id.to_owned(),
+                        group_id,
+                    });
+                }
+                let mut config = self.config.lock().unwrap();
+                let saved = config
+                    .disks
+                    .as_mut()
+                    .and_then(|disks| {
+                        disks
+                            .iter_mut()
+                            .find(|disk| disk.pci_common.id.as_deref() == Some(id))
+                    })
+                    .ok_or_else(|| {
+                        DeviceManagerError::RateLimitsInvalid(format!(
+                            "disk {id} has no saved config"
+                        ))
+                    })?;
+                let before = rate_group_config(&group);
+                let result = bandwidth.apply(&group);
+                let after = rate_group_config(&group);
+                if before != after {
+                    saved.rate_limiter_config = Some(after);
+                }
+                result
+                    .map(|_| ())
+                    .map_err(DeviceManagerError::RateLimitsUpdate)
+            }
+            (VmRateLimitsRequest::Net { rx, tx, .. }, Some(RateControl::Net(net))) => {
+                let groups = net.lock().unwrap().rate_limiter_groups().ok_or_else(|| {
+                    DeviceManagerError::RateLimitsUnsupported {
+                        id: id.to_owned(),
+                        reason: "legacy_per_queue_config",
+                    }
+                })?;
+                let mut config = self.config.lock().unwrap();
+                let saved = config
+                    .net
+                    .as_mut()
+                    .and_then(|nets| {
+                        nets.iter_mut()
+                            .find(|net| net.pci_common.id.as_deref() == Some(id))
+                    })
+                    .ok_or_else(|| {
+                        DeviceManagerError::RateLimitsInvalid(format!(
+                            "net {id} has no saved config"
+                        ))
+                    })?;
+                let before = (rate_group_config(&groups.rx), rate_group_config(&groups.tx));
+                let result = rx.apply(&groups.rx).and_then(|_| tx.apply(&groups.tx));
+                let after = (rate_group_config(&groups.rx), rate_group_config(&groups.tx));
+                if before != after {
+                    saved.rate_limiter_config =
+                        Some(virtio_devices::NetRateLimiterConfig::Aggregate {
+                            rx: after.0,
+                            tx: after.1,
+                        });
+                }
+                result
+                    .map(|_| ())
+                    .map_err(DeviceManagerError::RateLimitsUpdate)
+            }
+            (_, None) => Err(DeviceManagerError::RateLimitsUnsupported {
+                id: id.to_owned(),
+                reason: "external_backend",
+            }),
+            _ => Err(DeviceManagerError::RateLimitsInvalid(format!(
+                "wrong device type for {id}"
+            ))),
+        }
+    }
+
+    pub fn rate_limits(
+        &self,
+        update: Option<VmRateLimitsRequest>,
+    ) -> DeviceManagerResult<VmRateLimitsResponse> {
+        if let Some(update) = &update {
+            self.apply_rate_update(update)?;
+        }
+        let mut targets: Vec<_> = self
+            .virtio_devices
+            .iter()
+            .filter_map(|device| self.device_rate_state(device))
+            .collect();
+        let mut groups: Vec<_> = self.rate_limit_groups.iter().collect();
+        groups.sort_by_key(|(id, _)| *id);
+        targets.extend(
+            groups
+                .into_iter()
+                .map(|(id, group)| VmRateLimitsState::BlockGroup {
+                    id: id.clone(),
+                    members: self.rate_group_members(group),
+                    limiter: group.state().into(),
+                }),
+        );
+        if let Some(update) = update {
+            targets.retain(|state| match (&update, state) {
+                (
+                    VmRateLimitsRequest::Disk { id: expected, .. },
+                    VmRateLimitsState::Disk { id, .. },
+                )
+                | (
+                    VmRateLimitsRequest::Net { id: expected, .. },
+                    VmRateLimitsState::Net { id, .. },
+                )
+                | (
+                    VmRateLimitsRequest::BlockGroup { id: expected, .. },
+                    VmRateLimitsState::BlockGroup { id, .. },
+                ) => expected == id,
+                _ => false,
+            });
+        }
+        Ok(VmRateLimitsResponse { targets })
+    }
+
     pub fn counters(&self) -> HashMap<String, HashMap<&'static str, Wrapping<u64>>> {
         let mut counters = HashMap::new();
 
@@ -5786,6 +6092,28 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn live_disabled_named_group_round_trips_without_invalid_empty_config() {
+        let group = RateLimiterGroup::new("shared-data", 100, 0, 1000, 0, 0, 0).unwrap();
+        group.update_bandwidth(None).unwrap();
+        let saved = crate::vm_config::RateLimiterGroupConfig {
+            id: "shared-data".to_owned(),
+            rate_limiter_config: persisted_named_rate_config(rate_group_config(&group)),
+        };
+        let mut vm_config: VmConfig = serde_json::from_str("{}").unwrap();
+        saved.validate(&vm_config).unwrap();
+        assert_eq!(saved.rate_limiter_config.bandwidth.unwrap().size, 0);
+        vm_config.rate_limit_groups = Some(vec![saved]);
+        let serialized = serde_json::to_string(&vm_config).unwrap();
+        let restored: VmConfig = serde_json::from_str(&serialized).unwrap();
+        let saved = &restored.rate_limit_groups.as_ref().unwrap()[0];
+        saved.validate(&restored).unwrap();
+        assert_eq!(saved.id, "shared-data");
+        let owner = saved.rate_limiter_config.create_group(&saved.id).unwrap();
+        assert_eq!(owner.state().bandwidth.configured, None);
+        assert_eq!(owner.state().ops.configured, None);
+    }
 
     #[test]
     fn test_hotplugged_block_devices_use_64bit_bars() {

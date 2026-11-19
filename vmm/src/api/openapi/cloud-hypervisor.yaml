@@ -41,6 +41,40 @@ paths:
               schema:
                 $ref: "#/components/schemas/VmInfo"
 
+  /vm.rate-limits:
+    get:
+      summary: Inspect actual attached disk and network rate owners.
+      operationId: getVMRateLimits
+      responses:
+        200:
+          description: Effective policy, last-accounted credit and debt, and actual device identity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRateLimitsResponse"
+        500:
+          description: The VM or attached device state is unavailable.
+    put:
+      summary: Update one existing device or explicit shared block group.
+      operationId: updateVMRateLimits
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmRateLimitsRequest"
+      responses:
+        200:
+          description: Effective state read from the actual consuming owner after the operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRateLimitsResponse"
+        400:
+          description: Invalid, null, mixed, unknown or zero finite parameters. Neither NIC axis changes on invalid input.
+        500:
+          description: Target missing, wrong device type, external backend, finite legacy per-queue NIC, implicit shared-group update, or native update failure.
+
   /vm.counters:
     get:
       summary: Get counters from the VM
@@ -916,6 +950,7 @@ components:
 
     RateLimiterConfig:
       type: object
+      additionalProperties: false
       properties:
         bandwidth:
           $ref: "#/components/schemas/TokenBucket"
@@ -1057,7 +1092,7 @@ components:
           type: integer
           format: uint8
         rate_limiter_config:
-          $ref: "#/components/schemas/RateLimiterConfig"
+          $ref: "#/components/schemas/NetRateLimiterConfig"
         offload_tso:
           type: boolean
           default: true
@@ -1524,3 +1559,182 @@ components:
           type: string
         access:
           type: string
+
+    NetRateLimiterConfig:
+      description: Legacy symmetric per-queue policy, or independent device-wide aggregate RX and TX. Both aggregate axes are mandatory. Live conversion from finite legacy mode is unsupported.
+      oneOf:
+        - $ref: "#/components/schemas/RateLimiterConfig"
+        - type: object
+          additionalProperties: false
+          required: [rx, tx]
+          properties:
+            rx:
+              $ref: "#/components/schemas/RateLimiterConfig"
+            tx:
+              $ref: "#/components/schemas/RateLimiterConfig"
+
+    LiveBucketConfig:
+      type: object
+      additionalProperties: false
+      required: [size, refill_time]
+      properties:
+        size:
+          type: integer
+          format: uint64
+          minimum: 1
+        one_time_burst:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+        refill_time:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709
+
+    BandwidthPatch:
+      description: Omit an axis to leave it unchanged. Explicit unlimited clears only bandwidth; operation buckets remain intact. Reapplying the same policy neither refills credit nor renews initial burst.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [mode]
+          properties:
+            mode:
+              type: string
+              enum: [unlimited]
+        - type: object
+          additionalProperties: false
+          required: [mode, bucket]
+          properties:
+            mode:
+              type: string
+              enum: [limited]
+            bucket:
+              $ref: "#/components/schemas/LiveBucketConfig"
+
+    VmRateLimitsRequest:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [target, id]
+          properties:
+            target:
+              type: string
+              enum: [disk, block_group]
+            id:
+              type: string
+              minLength: 1
+            bandwidth:
+              $ref: "#/components/schemas/BandwidthPatch"
+        - type: object
+          additionalProperties: false
+          required: [target, id]
+          properties:
+            target:
+              type: string
+              enum: [net]
+            id:
+              type: string
+              minLength: 1
+            rx:
+              $ref: "#/components/schemas/BandwidthPatch"
+            tx:
+              $ref: "#/components/schemas/BandwidthPatch"
+
+    EffectiveBucket:
+      type: object
+      required: [policy, credit, burst, debt]
+      properties:
+        policy:
+          $ref: "#/components/schemas/BandwidthPatch"
+        credit:
+          type: integer
+          format: uint64
+        burst:
+          type: integer
+          format: uint64
+        debt:
+          type: integer
+          format: uint64
+
+    EffectiveRateLimiter:
+      type: object
+      required: [bandwidth, ops, blocked]
+      properties:
+        bandwidth:
+          $ref: "#/components/schemas/EffectiveBucket"
+        ops:
+          $ref: "#/components/schemas/EffectiveBucket"
+        blocked:
+          type: boolean
+
+    VmRateLimitsResponse:
+      type: object
+      required: [targets]
+      properties:
+        targets:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                required: [target, id, queues, active_queues, group_id, limiter, unsupported_reason]
+                properties:
+                  target:
+                    type: string
+                    enum: [disk]
+                  id:
+                    type: string
+                  queues:
+                    type: integer
+                  active_queues:
+                    type: integer
+                    nullable: true
+                  group_id:
+                    type: string
+                    nullable: true
+                  limiter:
+                    nullable: true
+                    allOf:
+                      - $ref: "#/components/schemas/EffectiveRateLimiter"
+                  unsupported_reason:
+                    type: string
+                    nullable: true
+              - type: object
+                required: [target, id, members, limiter]
+                properties:
+                  target:
+                    type: string
+                    enum: [block_group]
+                  id:
+                    type: string
+                  members:
+                    type: array
+                    items:
+                      type: string
+                  limiter:
+                    $ref: "#/components/schemas/EffectiveRateLimiter"
+              - type: object
+                required: [target, id, queue_pairs, active_queue_pairs, rx, tx, unsupported_reason]
+                properties:
+                  target:
+                    type: string
+                    enum: [net]
+                  id:
+                    type: string
+                  queue_pairs:
+                    type: integer
+                  active_queue_pairs:
+                    type: integer
+                    nullable: true
+                  rx:
+                    nullable: true
+                    allOf:
+                      - $ref: "#/components/schemas/EffectiveRateLimiter"
+                  tx:
+                    nullable: true
+                    allOf:
+                      - $ref: "#/components/schemas/EffectiveRateLimiter"
+                  unsupported_reason:
+                    type: string
+                    nullable: true

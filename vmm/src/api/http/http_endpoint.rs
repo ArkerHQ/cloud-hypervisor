@@ -551,6 +551,52 @@ impl EndpointHandler for VmActionHandler {
 // /api/v1/vm.info handler
 pub struct VmInfo {}
 
+pub struct VmRateLimits;
+
+impl EndpointHandler for VmRateLimits {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        let update = match req.method() {
+            Method::Get if req.body.is_none() => None,
+            Method::Put => {
+                let Some(body) = &req.body else {
+                    return error_response(HttpError::BadRequest, StatusCode::BadRequest);
+                };
+                let update: crate::api::VmRateLimitsRequest =
+                    match serde_json::from_slice(body.raw()) {
+                        Ok(update) => update,
+                        Err(error) => {
+                            return error_response(
+                                HttpError::SerdeJsonDeserialize(error),
+                                StatusCode::BadRequest,
+                            );
+                        }
+                    };
+                if update.validate().is_err() {
+                    return error_response(HttpError::BadRequest, StatusCode::BadRequest);
+                }
+                Some(update)
+            }
+            _ => return error_response(HttpError::BadRequest, StatusCode::BadRequest),
+        };
+        match crate::api::VmRateLimits.send(api_notifier, api_sender, update) {
+            Ok(Some(body)) => {
+                let mut response = Response::new(Version::Http11, StatusCode::OK);
+                response.set_body(body);
+                response
+            }
+            Ok(None) => error_response(HttpError::BadRequest, StatusCode::InternalServerError),
+            Err(error) => {
+                error_response(HttpError::ApiError(error), StatusCode::InternalServerError)
+            }
+        }
+    }
+}
+
 impl EndpointHandler for VmInfo {
     fn handle_request(
         &self,

@@ -762,6 +762,13 @@ impl Block {
         self.rate_limiter.clone()
     }
 
+    pub fn rate_queue_counts(&self) -> (usize, usize) {
+        (
+            self.common.queue_sizes.len(),
+            self.common.epoll_threads.as_ref().map_or(0, Vec::len),
+        )
+    }
+
     /// Create a new virtio block device that operates on the given file.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

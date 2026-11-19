@@ -84,6 +84,13 @@ fn generate_request(bytes: &[u8]) -> Option<Request> {
 struct StubApiRequestHandler;
 
 impl RequestHandler for StubApiRequestHandler {
+    fn vm_rate_limits(
+        &mut self,
+        _: Option<vmm::api::VmRateLimitsRequest>,
+    ) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(Some(br#"{"targets":[]}"#.to_vec()))
+    }
+
     fn vm_create(&mut self, _: Box<VmConfig>) -> Result<(), VmError> {
         Ok(())
     }

@@ -63,6 +63,9 @@ use crate::vm_config::{
 /// API errors are sent back from the VMM API server through the ApiResponse.
 #[derive(Error, Debug)]
 pub enum ApiError {
+    /// Existing-device rate policy could not be inspected or updated.
+    #[error("Existing-device rate policy operation failed")]
+    VmRateLimits(#[source] VmError),
     /// Cannot write to EventFd.
     #[error("Cannot write to EventFd")]
     EventFdWrite(#[source] io::Error),
@@ -504,7 +507,197 @@ pub enum ApiResponsePayload {
 /// This is the response sent by the VMM API server through the mpsc channel.
 pub type ApiResponse = Result<ApiResponsePayload, ApiError>;
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LiveBucketConfig {
+    pub size: u64,
+    #[serde(default)]
+    pub one_time_burst: u64,
+    pub refill_time: u64,
+}
+
+impl From<LiveBucketConfig> for rate_limiter::BucketConfig {
+    fn from(value: LiveBucketConfig) -> Self {
+        Self {
+            size: value.size,
+            one_time_burst: value.one_time_burst,
+            refill_time: value.refill_time,
+        }
+    }
+}
+
+impl From<rate_limiter::BucketConfig> for LiveBucketConfig {
+    fn from(value: rate_limiter::BucketConfig) -> Self {
+        Self {
+            size: value.size,
+            one_time_burst: value.one_time_burst,
+            refill_time: value.refill_time,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BandwidthPatch {
+    #[default]
+    #[serde(skip)]
+    Unchanged,
+    Unlimited,
+    Limited {
+        bucket: LiveBucketConfig,
+    },
+}
+
+impl BandwidthPatch {
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Self::Unchanged)
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        match self {
+            Self::Limited { bucket } => rate_limiter::BucketConfig::from(*bucket).validate(),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn apply(
+        &self,
+        group: &rate_limiter::group::RateLimiterGroup,
+    ) -> Result<bool, rate_limiter::group::Error> {
+        match self {
+            Self::Unchanged => Ok(false),
+            Self::Unlimited => group.update_bandwidth(None),
+            Self::Limited { bucket } => group.update_bandwidth(Some((*bucket).into())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "target", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VmRateLimitsRequest {
+    Disk {
+        id: String,
+        #[serde(default, skip_serializing_if = "BandwidthPatch::is_unchanged")]
+        bandwidth: BandwidthPatch,
+    },
+    BlockGroup {
+        id: String,
+        #[serde(default, skip_serializing_if = "BandwidthPatch::is_unchanged")]
+        bandwidth: BandwidthPatch,
+    },
+    Net {
+        id: String,
+        #[serde(default, skip_serializing_if = "BandwidthPatch::is_unchanged")]
+        rx: BandwidthPatch,
+        #[serde(default, skip_serializing_if = "BandwidthPatch::is_unchanged")]
+        tx: BandwidthPatch,
+    },
+}
+
+impl VmRateLimitsRequest {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Disk { id, .. } | Self::BlockGroup { id, .. } | Self::Net { id, .. } => id,
+        }
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if self.id().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty rate target id",
+            ));
+        }
+        match self {
+            Self::Disk { bandwidth, .. } | Self::BlockGroup { bandwidth, .. } => {
+                bandwidth.validate()
+            }
+            Self::Net { rx, tx, .. } => {
+                rx.validate()?;
+                tx.validate()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EffectiveBucket {
+    pub policy: BandwidthPatch,
+    pub credit: u64,
+    pub burst: u64,
+    pub debt: u64,
+}
+
+impl From<rate_limiter::BucketState> for EffectiveBucket {
+    fn from(value: rate_limiter::BucketState) -> Self {
+        Self {
+            policy: value
+                .configured
+                .map_or(BandwidthPatch::Unlimited, |bucket| {
+                    BandwidthPatch::Limited {
+                        bucket: bucket.into(),
+                    }
+                }),
+            credit: value.budget,
+            burst: value.burst,
+            debt: value.debt,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EffectiveRateLimiter {
+    pub bandwidth: EffectiveBucket,
+    pub ops: EffectiveBucket,
+    pub blocked: bool,
+}
+
+impl From<rate_limiter::RateLimiterState> for EffectiveRateLimiter {
+    fn from(value: rate_limiter::RateLimiterState) -> Self {
+        Self {
+            bandwidth: value.bandwidth.into(),
+            ops: value.ops.into(),
+            blocked: value.blocked,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum VmRateLimitsState {
+    Disk {
+        id: String,
+        group_id: Option<String>,
+        queues: usize,
+        active_queues: Option<usize>,
+        limiter: Option<EffectiveRateLimiter>,
+        unsupported_reason: Option<String>,
+    },
+    BlockGroup {
+        id: String,
+        members: Vec<String>,
+        limiter: EffectiveRateLimiter,
+    },
+    Net {
+        id: String,
+        queue_pairs: usize,
+        active_queue_pairs: Option<usize>,
+        rx: Option<EffectiveRateLimiter>,
+        tx: Option<EffectiveRateLimiter>,
+        unsupported_reason: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VmRateLimitsResponse {
+    pub targets: Vec<VmRateLimitsState>,
+}
+
 pub trait RequestHandler {
+    fn vm_rate_limits(
+        &mut self,
+        update: Option<VmRateLimitsRequest>,
+    ) -> Result<Option<Vec<u8>>, VmError>;
     fn vm_create(&mut self, config: Box<VmConfig>) -> Result<(), VmError>;
 
     fn vm_boot(&mut self) -> Result<(), VmError>;
@@ -1055,6 +1248,39 @@ impl ApiAction for VmCoredump {
 }
 
 pub struct VmCounters;
+
+pub struct VmRateLimits;
+
+impl ApiAction for VmRateLimits {
+    type RequestBody = Option<VmRateLimitsRequest>;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        update: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            let response = vmm
+                .vm_rate_limits(update)
+                .map_err(ApiError::VmRateLimits)
+                .map(ApiResponsePayload::VmAction);
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        update: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, update)
+    }
+}
 
 impl ApiAction for VmCounters {
     type RequestBody = ();
@@ -1759,6 +1985,26 @@ mod unit_tests {
     use super::{BandwidthPatch, VmRateLimitsRequest};
 
     #[test]
+    fn live_effective_readback_distinguishes_policy_from_consumed_credit() {
+        let group =
+            rate_limiter::group::RateLimiterGroup::new("actual", 100, 1000, 1_000_000, 0, 0, 0)
+                .unwrap();
+        group
+            .new_handle()
+            .unwrap()
+            .account_transferred(1050, 1)
+            .unwrap();
+        let value = serde_json::to_value(super::EffectiveRateLimiter::from(group.state())).unwrap();
+        assert_eq!(
+            value["bandwidth"]["policy"]["bucket"]["one_time_burst"],
+            1000
+        );
+        assert_eq!(value["bandwidth"]["burst"], 0);
+        assert_eq!(value["bandwidth"]["credit"], 50);
+        assert_eq!(value["ops"]["policy"]["mode"], "unlimited");
+    }
+
+    #[test]
     fn live_rate_omission_is_distinct_from_explicit_unlimited() {
         let omitted: VmRateLimitsRequest =
             serde_json::from_str(r#"{"target":"net","id":"actual-nic"}"#).unwrap();
@@ -1791,7 +2037,7 @@ mod unit_tests {
             serde_json::json!({"target":"net", "id":"data-net", "rx":{"mode":"unlimited", "bucket":{"size":1}}}),
             serde_json::json!({"target":"net", "id":"data-net", "tx":{"mode":"unlimited"}, "typo":0}),
         ] {
-            assert!(serde_json::from_value::<VmRateLimitsRequest>(value).is_err());
+            serde_json::from_value::<VmRateLimitsRequest>(value).unwrap_err();
         }
         for (size, refill_time) in [(0, 1000), (100, 0), (100, u64::MAX)] {
             let request: VmRateLimitsRequest = serde_json::from_value(serde_json::json!({
@@ -1800,7 +2046,7 @@ mod unit_tests {
                 "tx":{"mode":"limited", "bucket":{"size":size,"refill_time":refill_time}}
             }))
             .unwrap();
-            assert!(request.validate().is_err());
+            request.validate().unwrap_err();
         }
     }
     use super::*;

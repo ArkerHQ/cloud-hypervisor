@@ -2448,6 +2448,17 @@ impl Vm {
         Ok(self.device_manager.lock().unwrap().counters())
     }
 
+    pub fn rate_limits(
+        &mut self,
+        update: Option<crate::api::VmRateLimitsRequest>,
+    ) -> Result<crate::api::VmRateLimitsResponse> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .rate_limits(update)
+            .map_err(Error::DeviceManager)
+    }
+
     #[cfg(feature = "tdx")]
     fn extract_tdvf_sections(&mut self) -> Result<(Vec<TdvfSection>, bool)> {
         use arch::x86_64::tdx::*;
