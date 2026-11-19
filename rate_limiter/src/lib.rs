@@ -459,7 +459,10 @@ impl RateLimiterInner {
         }
         // Only the timer driver may retire an existing block. A late completed
         // transfer or rollback must leave readiness for sleeping peer queues.
-        if delay.is_none() && flag.load(Ordering::Acquire) {
+        if delay.is_none() {
+            if !flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
             delay = Some(Duration::from_nanos(1));
         }
         self.timer_fd.reset(delay.unwrap_or(Duration::ZERO), None)?;
