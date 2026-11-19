@@ -395,6 +395,48 @@ pub fn default_netconfig_true() -> bool {
     true
 }
 
+#[cfg(test)]
+mod live_rate_config_tests {
+    use virtio_devices::{NetRateLimiterConfig, RateLimiterConfig};
+
+    #[test]
+    fn legacy_and_aggregate_network_policy_have_distinct_wire_shapes() {
+        let old = serde_json::json!({"bandwidth": {"size": 100, "refill_time": 1000}});
+        let decoded: NetRateLimiterConfig = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(decoded, NetRateLimiterConfig::Legacy(_)));
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["bandwidth"],
+            serde_json::to_value(serde_json::from_value::<RateLimiterConfig>(old).unwrap())
+                .unwrap()["bandwidth"]
+        );
+        let aggregate =
+            serde_json::json!({"rx": {}, "tx": {"bandwidth": {"size": 200, "refill_time": 1000}}});
+        let decoded: NetRateLimiterConfig = serde_json::from_value(aggregate.clone()).unwrap();
+        assert!(matches!(decoded, NetRateLimiterConfig::Aggregate { .. }));
+        assert!(serde_json::from_value::<RateLimiterConfig>(aggregate).is_err());
+        let saved = serde_json::to_value(decoded).unwrap();
+        assert!(saved.get("rx").is_some());
+        assert!(saved.get("tx").is_some());
+        assert_eq!(
+            serde_json::from_value::<NetRateLimiterConfig>(saved).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
+    fn partial_null_and_mixed_network_modes_are_rejected() {
+        for value in [
+            serde_json::json!({"rx": {}}),
+            serde_json::json!({"tx": {}}),
+            serde_json::json!({"rx": null, "tx": {}}),
+            serde_json::json!({"rx": {}, "tx": {}, "bandwidth": {}}),
+            serde_json::json!({"rx": {}, "tx": {}, "typo": true}),
+        ] {
+            assert!(serde_json::from_value::<NetRateLimiterConfig>(value).is_err());
+        }
+    }
+}
+
 pub fn default_netconfig_tap() -> Option<String> {
     None
 }
