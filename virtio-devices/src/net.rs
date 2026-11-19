@@ -253,6 +253,11 @@ impl NetEpollHandler {
 
         if !rate_limit_reached {
             self.process_tx()?;
+        } else {
+            // A peer queue can block this group while TAP write readiness is pending.
+            self.net
+                .set_tx_tap_retry(false)
+                .map_err(DeviceError::NetQueuePair)?;
         }
 
         Ok(())
@@ -462,6 +467,13 @@ impl Net {
     /// Control references to the actual aggregate consumer owners, when supported.
     pub fn rate_limiter_groups(&self) -> Option<NetRateLimiterGroups> {
         self.rate_groups.clone()
+    }
+
+    pub fn rate_queue_pair_counts(&self) -> (usize, usize) {
+        (
+            self.common.queue_sizes.len() / 2,
+            self.common.epoll_threads.as_ref().map_or(0, Vec::len),
+        )
     }
 
     /// Create a new virtio network device with the given TAP interface.

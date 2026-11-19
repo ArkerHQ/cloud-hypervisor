@@ -8,7 +8,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use log::{error, info};
+use log::error;
 use rate_limiter::group::RateLimiterGroupHandle;
 use rate_limiter::{RateLimiter, TokenType};
 use thiserror::Error;
@@ -550,6 +550,35 @@ pub enum NetQueuePairError {
     DescriptorInvalidHeader,
 }
 
+fn set_tx_tap_retry(
+    epoll_fd: RawFd,
+    tap_fd: RawFd,
+    event_id: u16,
+    listening: &mut bool,
+    retry: bool,
+) -> io::Result<()> {
+    if retry == *listening {
+        return Ok(());
+    }
+    if retry {
+        register_listener(
+            epoll_fd,
+            tap_fd,
+            epoll::Events::EPOLLOUT,
+            u64::from(event_id),
+        )?;
+    } else {
+        unregister_listener(
+            epoll_fd,
+            tap_fd,
+            epoll::Events::EPOLLOUT,
+            u64::from(event_id),
+        )?;
+    }
+    *listening = retry;
+    Ok(())
+}
+
 pub struct NetQueuePair {
     pub tap: Tap,
     // With epoll each FD must be unique. So in order to filter the
@@ -572,6 +601,23 @@ pub struct NetQueuePair {
 }
 
 impl NetQueuePair {
+    pub fn set_tx_tap_retry(&mut self, retry: bool) -> Result<(), NetQueuePairError> {
+        set_tx_tap_retry(
+            self.epoll_fd.unwrap(),
+            self.tap_for_write_epoll.as_raw_fd(),
+            self.tap_tx_event_id,
+            &mut self.tx_tap_listening,
+            retry,
+        )
+        .map_err(|error| {
+            if retry {
+                NetQueuePairError::RegisterListener(error)
+            } else {
+                NetQueuePairError::UnregisterListener(error)
+            }
+        })
+    }
+
     pub fn process_tx<B: Bitmap + 'static>(
         &mut self,
         mem: &vm_memory::GuestMemoryMmap<B>,
@@ -585,28 +631,7 @@ impl NetQueuePair {
             self.access_platform.as_deref(),
         )?;
 
-        // We got told to try again when writing to the tap. Wait for the TAP to be writable
-        if tx_tap_retry && !self.tx_tap_listening {
-            register_listener(
-                self.epoll_fd.unwrap(),
-                self.tap_for_write_epoll.as_raw_fd(),
-                epoll::Events::EPOLLOUT,
-                u64::from(self.tap_tx_event_id),
-            )
-            .map_err(NetQueuePairError::RegisterListener)?;
-            self.tx_tap_listening = true;
-            info!("Writing to TAP returned EAGAIN. Listening for TAP to become writable.");
-        } else if !tx_tap_retry && self.tx_tap_listening {
-            unregister_listener(
-                self.epoll_fd.unwrap(),
-                self.tap_for_write_epoll.as_raw_fd(),
-                epoll::Events::EPOLLOUT,
-                u64::from(self.tap_tx_event_id),
-            )
-            .map_err(NetQueuePairError::UnregisterListener)?;
-            self.tx_tap_listening = false;
-            info!("Writing to TAP succeeded. No longer listening for TAP to become writable.");
-        }
+        self.set_tx_tap_retry(tx_tap_retry)?;
 
         self.counters
             .tx_bytes
@@ -673,6 +698,83 @@ mod live_rate_tests {
     use super::NetRateLimiter;
     use rate_limiter::RateLimiter;
     use rate_limiter::group::RateLimiterGroup;
+
+    #[test]
+    fn writable_retry_is_removed_while_peer_blocks_and_can_resume() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::net::UnixStream;
+        let (mut output, mut input) = UnixStream::pair().unwrap();
+        output.set_nonblocking(true).unwrap();
+        input.set_nonblocking(true).unwrap();
+        let block = [0u8; 4096];
+        loop {
+            match output.write(&block) {
+                Ok(count) => assert!(count > 0),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("write failed: {error}"),
+            }
+        }
+        let fd = epoll::create(true).unwrap();
+        // SAFETY: fd is a new epoll descriptor owned only by this File.
+        let epoll = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut listening = false;
+        super::set_tx_tap_retry(
+            epoll.as_raw_fd(),
+            output.as_raw_fd(),
+            1,
+            &mut listening,
+            true,
+        )
+        .unwrap();
+        let mut events = [epoll::Event::new(epoll::Events::empty(), 0); 1];
+        assert_eq!(epoll::wait(epoll.as_raw_fd(), 0, &mut events).unwrap(), 0);
+        let group = RateLimiterGroup::new("actual-nic-tx", 100, 0, 1_000_000, 0, 0, 0).unwrap();
+        let waiting = group.new_handle().unwrap();
+        group
+            .new_handle()
+            .unwrap()
+            .account_transferred(200, 0)
+            .unwrap();
+        assert!(waiting.is_blocked());
+        let mut buffer = [0u8; 8192];
+        loop {
+            match input.read(&mut buffer) {
+                Ok(count) => assert!(count > 0),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("read failed: {error}"),
+            }
+        }
+        assert_eq!(
+            epoll::wait(epoll.as_raw_fd(), 1000, &mut events).unwrap(),
+            1
+        );
+        super::set_tx_tap_retry(
+            epoll.as_raw_fd(),
+            output.as_raw_fd(),
+            1,
+            &mut listening,
+            false,
+        )
+        .unwrap();
+        assert!(!listening);
+        assert_eq!(epoll::wait(epoll.as_raw_fd(), 0, &mut events).unwrap(), 0);
+        group.update_bandwidth(None).unwrap();
+        waiting.event_handler().unwrap();
+        assert!(!waiting.is_blocked());
+        super::set_tx_tap_retry(
+            epoll.as_raw_fd(),
+            output.as_raw_fd(),
+            1,
+            &mut listening,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            epoll::wait(epoll.as_raw_fd(), 1000, &mut events).unwrap(),
+            1
+        );
+    }
 
     #[test]
     fn completed_packets_always_charge_both_group_axes() {
