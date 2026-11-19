@@ -14,7 +14,7 @@ use log::{error, info, warn};
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::{RateLimiter, TokenType};
+use crate::{BucketConfig, RateLimiter, RateLimiterState, TokenType};
 
 /// Errors associated with rate-limiter group.
 #[derive(Debug, Error)]
@@ -56,7 +56,8 @@ pub struct RateLimiterGroupHandle {
 
 impl RateLimiterGroupHandle {
     fn new(inner: Arc<RateLimiterGroupInner>) -> result::Result<Self, Error> {
-        let eventfd = Arc::new(EventFd::new(0).map_err(Error::EventFd)?);
+        let eventfd =
+            Arc::new(EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).map_err(Error::EventFd)?);
         inner.handles.lock().unwrap().push(eventfd.clone());
         Ok(Self { eventfd, inner })
     }
@@ -65,7 +66,15 @@ impl RateLimiterGroupHandle {
     ///
     /// If rate limiting is disabled on provided `token_type`, this function will always succeed.
     pub fn consume(&self, tokens: u64, token_type: TokenType) -> bool {
-        self.inner.rate_limiter.consume(tokens, token_type)
+        self.inner.rate_limiter.consume_managed(tokens, token_type)
+    }
+
+    /// Charge both completed-I/O axes, including transfers racing a blocked peer.
+    pub fn account_transferred(&self, bytes: u64, ops: u64) -> result::Result<bool, Error> {
+        self.inner
+            .rate_limiter
+            .account_transferred(bytes, ops)
+            .map_err(Error::RateLimiter)
     }
 
     /// Adds tokens of `token_type` to their respective bucket.
@@ -73,7 +82,9 @@ impl RateLimiterGroupHandle {
     /// Can be used to *manually* add tokens to a bucket. Useful for reverting a
     /// `consume()` if needed.
     pub fn manual_replenish(&self, tokens: u64, token_type: TokenType) {
-        self.inner.rate_limiter.manual_replenish(tokens, token_type);
+        self.inner
+            .rate_limiter
+            .manual_replenish_managed(tokens, token_type);
     }
 
     /// This function needs to be called every time there is an event on the
@@ -83,7 +94,11 @@ impl RateLimiterGroupHandle {
     ///
     /// If the rate limiter is disabled or is not blocked, an error is returned.
     pub fn event_handler(&self) -> Result<(), Error> {
-        self.eventfd.read().map_err(Error::EventFdRead).map(|_| ())
+        match self.eventfd.read() {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(Error::EventFdRead(error)),
+        }
     }
 
     /// Returns whether this rate limiter is blocked.
@@ -125,11 +140,42 @@ struct RateLimiterGroupInner {
     handles: Mutex<Vec<Arc<EventFd>>>,
 }
 
+impl RateLimiterGroupInner {
+    fn notify(&self) -> result::Result<(), Error> {
+        for handle in self.handles.lock().unwrap().iter() {
+            loop {
+                match handle.write(1) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(Error::EventFdWrite(error)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn process_timer(&self) -> result::Result<(), Error> {
+        if self
+            .rate_limiter
+            .managed_event_handler()
+            .map_err(Error::RateLimiter)?
+        {
+            self.notify()?;
+        }
+        Ok(())
+    }
+}
+
 /// A RateLimiterGroup is an extension of RateLimiter that enables rate-limiting
 /// the aggregate io consumption of multiple consumers.
 pub struct RateLimiterGroup {
     inner: Arc<RateLimiterGroupInner>,
-    epoll_file: File,
+    driver: Option<ThreadDriver>,
+}
+
+struct ThreadDriver {
+    _epoll_file: File,
     kill_evt: EventFd,
     epoll_thread: Option<thread::JoinHandle<()>>,
 }
@@ -174,39 +220,47 @@ impl RateLimiterGroup {
         )
         .map_err(Error::RateLimiter)?;
 
-        let epoll_fd = epoll::create(true).map_err(Error::Epoll)?;
-        let kill_evt = EventFd::new(0).map_err(Error::EventFd)?;
-
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            kill_evt.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Kill as u64),
-        )
-        .map_err(Error::Epoll)?;
-
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            rate_limiter.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Unblocked as u64),
-        )
-        .map_err(Error::Epoll)?;
-
-        // Use 'File' to enforce closing on 'epoll_fd'
-        // SAFETY: epoll_fd is valid
-        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
-
         Ok(Self {
             inner: Arc::new(RateLimiterGroupInner {
                 id: id.to_string(),
                 rate_limiter,
                 handles: Mutex::new(Vec::new()),
             }),
-            epoll_file,
-            kill_evt,
-            epoll_thread: None,
+            driver: None,
         })
+    }
+
+    /// Observe the limiter shared by the attached consumers.
+    pub fn state(&self) -> RateLimiterState {
+        self.inner.rate_limiter.managed_state()
+    }
+
+    /// Change the shared bandwidth policy and wake consumers only on real change.
+    pub fn update_bandwidth(&self, target: Option<BucketConfig>) -> result::Result<bool, Error> {
+        let changed = self
+            .inner
+            .rate_limiter
+            .update_bandwidth(target)
+            .map_err(Error::RateLimiter)?;
+        if changed {
+            self.inner.notify()?;
+        }
+        Ok(changed)
+    }
+
+    /// Whether an existing device queue, rather than a group thread, owns the timer.
+    pub fn is_externally_driven(&self) -> bool {
+        self.driver.is_none()
+    }
+
+    /// Timer watched by queue zero for an externally driven group.
+    pub fn timer_fd(&self) -> RawFd {
+        self.inner.rate_limiter.as_raw_fd()
+    }
+
+    /// Service the same timer and broadcast the resulting readiness to every queue.
+    pub fn process_timer(&self) -> result::Result<(), Error> {
+        self.inner.process_timer()
     }
 
     /// Create a new RateLimiterGroupHandle.
@@ -217,9 +271,30 @@ impl RateLimiterGroup {
     /// Start a worker thread to broadcast an event to each RateLimiterGroupHandle
     /// when the RateLimiter becomes unblocked.
     pub fn start_thread(&mut self, exit_evt: EventFd) -> result::Result<(), Error> {
+        if self.driver.is_some() {
+            return Ok(());
+        }
+        let epoll_fd = epoll::create(true).map_err(Error::Epoll)?;
+        // SAFETY: epoll_fd is a newly created valid descriptor, owned only here.
+        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+        let kill_evt =
+            EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).map_err(Error::EventFd)?;
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            kill_evt.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Kill as u64),
+        )
+        .map_err(Error::Epoll)?;
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            self.timer_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Unblocked as u64),
+        )
+        .map_err(Error::Epoll)?;
         let inner = self.inner.clone();
-        let epoll_fd = self.epoll_file.as_raw_fd();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name(format!("rate-limit-group-{}", inner.id))
             .spawn(move || {
                 let res = std::panic::catch_unwind(AssertUnwindSafe(move || {
@@ -247,11 +322,7 @@ impl RateLimiterGroup {
                                     warn!("Unknown rate-limiter loop event: {event}");
                                 }
                                 EpollDispatch::Unblocked => {
-                                    inner.rate_limiter.event_handler().unwrap();
-                                    let handles = inner.handles.lock().unwrap();
-                                    for handle in handles.iter() {
-                                        handle.write(1).map_err(Error::EventFdWrite)?;
-                                    }
+                                    inner.process_timer()?;
                                 }
                                 EpollDispatch::Kill => {
                                     info!(
@@ -277,18 +348,24 @@ impl RateLimiterGroup {
                     }
                 }
             })
-            .map(|thread| self.epoll_thread.insert(thread))
             .map_err(Error::ThreadSpawn)?;
-
+        self.driver = Some(ThreadDriver {
+            _epoll_file: epoll_file,
+            kill_evt,
+            epoll_thread: Some(thread),
+        });
         Ok(())
     }
 }
 
 impl Drop for RateLimiterGroup {
     fn drop(&mut self) {
-        self.kill_evt.write(1).unwrap();
+        let Some(driver) = self.driver.as_mut() else {
+            return;
+        };
+        driver.kill_evt.write(1).unwrap();
 
-        if let Some(t) = self.epoll_thread.take()
+        if let Some(t) = driver.epoll_thread.take()
             && let Err(e) = t.join()
         {
             error!("Error joining thread: {e:?}");
