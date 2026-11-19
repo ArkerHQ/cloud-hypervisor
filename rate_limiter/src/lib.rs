@@ -73,6 +73,58 @@ const REFILL_TIMER_INTERVAL_MS: u64 = 100;
 const TIMER_REFILL_DUR: Duration = Duration::from_millis(REFILL_TIMER_INTERVAL_MS);
 
 const NANOSEC_IN_ONE_MILLISEC: u64 = 1_000_000;
+const TOKEN_SCALE: u128 = 1_000_000_000;
+
+/// Immutable parameters of one finite token bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BucketConfig {
+    /// Number of tokens replenished in one refill period.
+    pub size: u64,
+    /// Initial extra tokens, granted once in this native instance.
+    pub one_time_burst: u64,
+    /// Refill period in milliseconds.
+    pub refill_time: u64,
+}
+
+impl BucketConfig {
+    /// Reject a disabled or arithmetically invalid finite configuration.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.size == 0
+            || self.refill_time == 0
+            || self.refill_time > u64::MAX / NANOSEC_IN_ONE_MILLISEC
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid finite bucket",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Last-accounted effective state of one bucket; observing it never refills it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BucketState {
+    /// A finite configuration, or explicit unlimited.
+    pub configured: Option<BucketConfig>,
+    /// Remaining ordinary token credit.
+    pub budget: u64,
+    /// Remaining initial burst credit.
+    pub burst: u64,
+    /// Outstanding token debt rounded up, saturating at u64::MAX.
+    pub debt: u64,
+}
+
+/// Effective state read from the actual consuming limiter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimiterState {
+    /// Byte accounting and policy.
+    pub bandwidth: BucketState,
+    /// Operation accounting and policy.
+    pub ops: BucketState,
+    /// Whether consumers currently wait for the timer.
+    pub blocked: bool,
+}
 
 // Euclid's two-thousand-year-old algorithm for finding the greatest common divisor.
 fn gcd(x: u64, y: u64) -> u64 {
@@ -115,6 +167,11 @@ pub struct TokenBucket {
     // Fields used for pre-processing optimizations.
     processed_capacity: u64,
     processed_refill_time: u64,
+    configured_burst: u64,
+    enabled: bool,
+    // Fixed-point credit/debt belongs to the same bucket as its ordinary budget.
+    debt: u128,
+    fraction: u128,
 }
 
 impl TokenBucket {
@@ -153,7 +210,84 @@ impl TokenBucket {
             last_update: Instant::now(),
             processed_capacity,
             processed_refill_time,
+            configured_burst: one_time_burst,
+            enabled: true,
+            debt: 0,
+            fraction: 0,
         })
+    }
+
+    fn configured(&self) -> Option<BucketConfig> {
+        self.enabled.then_some(BucketConfig {
+            size: self.size,
+            one_time_burst: self.configured_burst,
+            refill_time: self.refill_time,
+        })
+    }
+
+    fn state(&self) -> BucketState {
+        BucketState {
+            configured: self.configured(),
+            budget: self.budget,
+            burst: self.one_time_burst,
+            debt: u64::try_from(self.debt.div_ceil(TOKEN_SCALE)).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn settle_at(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_nanos()
+            .min(u128::from(u64::MAX));
+        let numerator = elapsed * u128::from(self.size);
+        let denominator = u128::from(self.refill_time) * u128::from(NANOSEC_IN_ONE_MILLISEC);
+        let credit = (numerator / denominator)
+            .saturating_mul(TOKEN_SCALE)
+            .saturating_add((numerator % denominator) * TOKEN_SCALE / denominator);
+        self.last_update = now;
+        let repaid = credit.min(self.debt);
+        self.debt -= repaid;
+        if self.enabled {
+            let available = (u128::from(self.budget) * TOKEN_SCALE + self.fraction)
+                .saturating_add(credit - repaid)
+                .min(u128::from(self.size) * TOKEN_SCALE);
+            self.budget = (available / TOKEN_SCALE) as u64;
+            self.fraction = available % TOKEN_SCALE;
+        }
+    }
+
+    fn charge(&mut self, tokens: u64) {
+        if !self.enabled {
+            return;
+        }
+        let burst = tokens.min(self.one_time_burst);
+        self.one_time_burst -= burst;
+        let requested = u128::from(tokens - burst) * TOKEN_SCALE;
+        let available = u128::from(self.budget) * TOKEN_SCALE + self.fraction;
+        if requested > available {
+            self.debt = self.debt.saturating_add(requested - available);
+            self.budget = 0;
+            self.fraction = 0;
+        } else {
+            self.budget = ((available - requested) / TOKEN_SCALE) as u64;
+            self.fraction = (available - requested) % TOKEN_SCALE;
+        }
+    }
+
+    fn debt_delay(&self) -> Option<Duration> {
+        if !self.enabled || self.debt == 0 {
+            return None;
+        }
+        let denominator = u128::from(self.refill_time) * u128::from(NANOSEC_IN_ONE_MILLISEC);
+        let tokens = self.debt / TOKEN_SCALE;
+        let fraction = self.debt % TOKEN_SCALE;
+        let numerator = tokens
+            .saturating_mul(denominator)
+            .saturating_add((fraction * denominator).div_ceil(TOKEN_SCALE));
+        let nanos = numerator.div_ceil(u128::from(self.size)).max(1);
+        Some(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
     }
 
     /// Attempts to consume `tokens` from the bucket and returns whether the action succeeded.
@@ -283,6 +417,7 @@ pub struct RateLimiter {
 
     // Internal flag that quickly determines timer state.
     timer_active: AtomicBool,
+    managed_enabled: AtomicBool,
 }
 
 struct RateLimiterInner {
@@ -290,9 +425,43 @@ struct RateLimiterInner {
     ops: Option<TokenBucket>,
 
     timer_fd: TimerFd,
+    managed_retry: [Option<Instant>; 2],
 }
 
 impl RateLimiterInner {
+    fn settle_managed(&mut self, now: Instant) {
+        for bucket in [&mut self.bandwidth, &mut self.ops].into_iter().flatten() {
+            bucket.settle_at(now);
+        }
+    }
+
+    fn reschedule_managed(&mut self, now: Instant, flag: &AtomicBool) -> io::Result<()> {
+        let mut delay = None;
+        for (index, bucket) in [self.bandwidth.as_ref(), self.ops.as_ref()]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(bucket) = bucket.filter(|bucket| bucket.enabled) else {
+                self.managed_retry[index] = None;
+                continue;
+            };
+            if let Some(debt) = bucket.debt_delay() {
+                delay = Some(delay.map_or(debt, |old: Duration| old.max(debt)));
+            }
+            if let Some(retry) = self.managed_retry[index] {
+                if retry > now {
+                    let retry = retry.duration_since(now);
+                    delay = Some(delay.map_or(retry, |old| old.max(retry)));
+                } else {
+                    self.managed_retry[index] = None;
+                }
+            }
+        }
+        self.timer_fd.reset(delay.unwrap_or(Duration::ZERO), None)?;
+        flag.store(delay.is_some(), Ordering::Release);
+        Ok(())
+    }
+
     // Arm the timer of the rate limiter with the provided `Duration` (which will fire only once).
     fn activate_timer(&mut self, dur: Duration, flag: &AtomicBool) {
         // Panic when failing to arm the timer (same handling in crate TimerFd::set_state())
@@ -333,6 +502,17 @@ impl RateLimiter {
         ops_one_time_burst: u64,
         ops_complete_refill_time_ms: u64,
     ) -> io::Result<Self> {
+        for (size, refill_time) in [
+            (bytes_total_capacity, bytes_complete_refill_time_ms),
+            (ops_total_capacity, ops_complete_refill_time_ms),
+        ] {
+            if size != 0 && refill_time > u64::MAX / NANOSEC_IN_ONE_MILLISEC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bucket refill overflows nanoseconds",
+                ));
+            }
+        }
         let bytes_token_bucket = TokenBucket::new(
             bytes_total_capacity,
             bytes_one_time_burst,
@@ -367,9 +547,206 @@ impl RateLimiter {
                 bandwidth: bytes_token_bucket,
                 ops: ops_token_bucket,
                 timer_fd,
+                managed_retry: [None, None],
             }),
             timer_active: AtomicBool::new(false),
+            managed_enabled: AtomicBool::new(
+                (bytes_total_capacity != 0 && bytes_complete_refill_time_ms != 0)
+                    || (ops_total_capacity != 0 && ops_complete_refill_time_ms != 0),
+            ),
         })
+    }
+
+    /// Observe actual effective policy, credit and debt without changing them.
+    pub fn managed_state(&self) -> RateLimiterState {
+        let inner = self.inner.lock().unwrap();
+        RateLimiterState {
+            bandwidth: inner
+                .bandwidth
+                .as_ref()
+                .map_or(BucketState::default(), TokenBucket::state),
+            ops: inner
+                .ops
+                .as_ref()
+                .map_or(BucketState::default(), TokenBucket::state),
+            blocked: self.timer_active.load(Ordering::Acquire),
+        }
+    }
+
+    /// Change bandwidth without refilling credit, renewing burst or erasing debt.
+    /// None explicitly disables bandwidth; operation limits are unchanged.
+    pub fn update_bandwidth(&self, target: Option<BucketConfig>) -> io::Result<bool> {
+        if let Some(config) = target {
+            config.validate()?;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let current = inner.bandwidth.as_ref().and_then(TokenBucket::configured);
+        if current == target {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        inner.settle_managed(now);
+        match (inner.bandwidth.as_mut(), target) {
+            (Some(bucket), Some(config)) => {
+                let was_enabled = bucket.enabled;
+                bucket.size = config.size;
+                bucket.refill_time = config.refill_time;
+                bucket.configured_burst = config.one_time_burst;
+                bucket.one_time_burst = if was_enabled {
+                    bucket.one_time_burst.min(config.one_time_burst)
+                } else {
+                    0
+                };
+                bucket.budget = bucket.budget.min(config.size);
+                if bucket.budget == config.size {
+                    bucket.fraction = 0;
+                }
+                bucket.enabled = true;
+                let refill_ns = config.refill_time * NANOSEC_IN_ONE_MILLISEC;
+                let factor = gcd(config.size, refill_ns);
+                bucket.processed_capacity = config.size / factor;
+                bucket.processed_refill_time = refill_ns / factor;
+            }
+            (Some(bucket), None) => {
+                bucket.enabled = false;
+                bucket.budget = 0;
+                bucket.fraction = 0;
+                bucket.one_time_burst = 0;
+            }
+            (None, Some(config)) => {
+                inner.bandwidth =
+                    TokenBucket::new(config.size, config.one_time_burst, config.refill_time);
+            }
+            (None, None) => unreachable!(),
+        }
+        inner.managed_retry[0] = None;
+        self.managed_enabled.store(
+            inner
+                .bandwidth
+                .as_ref()
+                .is_some_and(|bucket| bucket.enabled)
+                || inner.ops.as_ref().is_some_and(|bucket| bucket.enabled),
+            Ordering::Release,
+        );
+        // Drain old readiness while the same lock excludes the timer handler.
+        inner.timer_fd.reset(Duration::ZERO, None)?;
+        loop {
+            match inner.timer_fd.wait().map_err(io::Error::from) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        inner.reschedule_managed(now, &self.timer_active)?;
+        Ok(true)
+    }
+
+    /// Admit block-style work before I/O, borrowing only for oversized requests.
+    pub fn consume_managed(&self, tokens: u64, token_type: TokenType) -> bool {
+        if !self.managed_enabled.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.is_blocked() {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if self.is_blocked() {
+            return false;
+        }
+        let now = Instant::now();
+        inner.settle_managed(now);
+        let index = match token_type {
+            TokenType::Bytes => 0,
+            TokenType::Ops => 1,
+        };
+        let bucket = match token_type {
+            TokenType::Bytes => &mut inner.bandwidth,
+            TokenType::Ops => &mut inner.ops,
+        };
+        let mut admitted = true;
+        if let Some(bucket) = bucket.as_mut().filter(|bucket| bucket.enabled) {
+            let remaining = tokens.saturating_sub(bucket.one_time_burst);
+            let available = u128::from(bucket.budget) * TOKEN_SCALE + bucket.fraction;
+            if u128::from(remaining) * TOKEN_SCALE > available && remaining <= bucket.size {
+                admitted = false;
+            } else {
+                bucket.charge(tokens);
+            }
+        }
+        if !admitted {
+            inner.managed_retry[index] = Some(now + TIMER_REFILL_DUR);
+        }
+        inner
+            .reschedule_managed(now, &self.timer_active)
+            .expect("cannot arm group limiter timer");
+        admitted
+    }
+
+    /// Charge both actual completed-I/O axes, even after another consumer blocks.
+    /// False means consumers must wait; the transferred work is always charged.
+    pub fn account_transferred(&self, bytes: u64, ops: u64) -> io::Result<bool> {
+        if !self.managed_enabled.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        inner.settle_managed(now);
+        if let Some(bucket) = &mut inner.bandwidth {
+            bucket.charge(bytes);
+        }
+        if let Some(bucket) = &mut inner.ops {
+            bucket.charge(ops);
+        }
+        inner.reschedule_managed(now, &self.timer_active)?;
+        Ok(!self.is_blocked())
+    }
+
+    /// Roll back pre-admitted work, paying outstanding debt before adding credit.
+    pub fn manual_replenish_managed(&self, tokens: u64, token_type: TokenType) {
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        inner.settle_managed(now);
+        let bucket = match token_type {
+            TokenType::Bytes => &mut inner.bandwidth,
+            TokenType::Ops => &mut inner.ops,
+        };
+        if let Some(bucket) = bucket.as_mut().filter(|bucket| bucket.enabled) {
+            let credit = u128::from(tokens) * TOKEN_SCALE;
+            let repaid = credit.min(bucket.debt);
+            bucket.debt -= repaid;
+            let remaining = (credit - repaid) / TOKEN_SCALE;
+            if bucket.one_time_burst != 0 {
+                bucket.one_time_burst =
+                    u64::try_from(u128::from(bucket.one_time_burst) + remaining)
+                        .unwrap_or(u64::MAX)
+                        .min(bucket.configured_burst);
+            } else {
+                bucket.budget = u64::try_from(u128::from(bucket.budget) + remaining)
+                    .unwrap_or(u64::MAX)
+                    .min(bucket.size);
+            }
+        }
+        inner
+            .reschedule_managed(now, &self.timer_active)
+            .expect("cannot arm group limiter timer");
+    }
+
+    /// Drain group timer readiness; stale events are benign, and unpaid debt stays blocked.
+    pub fn managed_event_handler(&self) -> io::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            match inner.timer_fd.wait().map_err(io::Error::from) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        let now = Instant::now();
+        inner.settle_managed(now);
+        inner.reschedule_managed(now, &self.timer_active)?;
+        Ok(!self.is_blocked())
     }
 
     /// Attempts to consume tokens and returns whether that is possible.
@@ -922,7 +1299,11 @@ pub(crate) mod unit_tests {
     }
 
     fn live_config(size: u64, burst: u64) -> BucketConfig {
-        BucketConfig { size, one_time_burst: burst, refill_time: 1_000_000 }
+        BucketConfig {
+            size,
+            one_time_burst: burst,
+            refill_time: 1_000_000,
+        }
     }
 
     #[test]
@@ -934,7 +1315,11 @@ pub(crate) mod unit_tests {
         assert!(before.blocked);
         assert_eq!(before.bandwidth.debt, 1);
         for _ in 0..20 {
-            assert!(!limiter.update_bandwidth(Some(live_config(100, 1000))).unwrap());
+            assert!(
+                !limiter
+                    .update_bandwidth(Some(live_config(100, 1000)))
+                    .unwrap()
+            );
         }
         assert_eq!(limiter.managed_state(), before);
         assert_eq!(limiter.inner.lock().unwrap().bandwidth, bucket);
@@ -957,7 +1342,11 @@ pub(crate) mod unit_tests {
         let limiter = RateLimiter::new(100, 1000, 1_000_000, 0, 0, 0).unwrap();
         limiter.account_transferred(1200, 1).unwrap();
         for size in [200, 50, 300, 100] {
-            assert!(limiter.update_bandwidth(Some(live_config(size, size * 10))).unwrap());
+            assert!(
+                limiter
+                    .update_bandwidth(Some(live_config(size, size * 10)))
+                    .unwrap()
+            );
             let state = limiter.managed_state();
             assert_eq!(state.bandwidth.burst, 0);
             assert_eq!(state.bandwidth.budget, 0);
@@ -973,7 +1362,11 @@ pub(crate) mod unit_tests {
         assert!(limiter.update_bandwidth(None).unwrap());
         assert!(!limiter.is_blocked());
         assert_eq!(limiter.managed_state().bandwidth.configured, None);
-        assert!(limiter.update_bandwidth(Some(live_config(200, 2000))).unwrap());
+        assert!(
+            limiter
+                .update_bandwidth(Some(live_config(200, 2000)))
+                .unwrap()
+        );
         let state = limiter.managed_state();
         assert_eq!(state.bandwidth.burst, 0);
         assert_eq!(state.bandwidth.debt, 100);
@@ -984,10 +1377,18 @@ pub(crate) mod unit_tests {
     fn live_first_finite_policy_gets_one_initial_burst() {
         let limiter = RateLimiter::default();
         assert!(!limiter.update_bandwidth(None).unwrap());
-        assert!(limiter.update_bandwidth(Some(live_config(100, 1000))).unwrap());
+        assert!(
+            limiter
+                .update_bandwidth(Some(live_config(100, 1000)))
+                .unwrap()
+        );
         assert_eq!(limiter.managed_state().bandwidth.burst, 1000);
         assert!(limiter.update_bandwidth(None).unwrap());
-        assert!(limiter.update_bandwidth(Some(live_config(100, 1000))).unwrap());
+        assert!(
+            limiter
+                .update_bandwidth(Some(live_config(100, 1000)))
+                .unwrap()
+        );
         assert_eq!(limiter.managed_state().bandwidth.burst, 0);
     }
 
@@ -1006,9 +1407,21 @@ pub(crate) mod unit_tests {
         let limiter = RateLimiter::new(100, 0, 1000, 1, 0, 1000).unwrap();
         let before = limiter.managed_state();
         for config in [
-            BucketConfig { size: 0, one_time_burst: 0, refill_time: 1000 },
-            BucketConfig { size: 1, one_time_burst: 0, refill_time: 0 },
-            BucketConfig { size: 1, one_time_burst: 0, refill_time: u64::MAX },
+            BucketConfig {
+                size: 0,
+                one_time_burst: 0,
+                refill_time: 1000,
+            },
+            BucketConfig {
+                size: 1,
+                one_time_burst: 0,
+                refill_time: 0,
+            },
+            BucketConfig {
+                size: 1,
+                one_time_burst: 0,
+                refill_time: u64::MAX,
+            },
         ] {
             assert!(limiter.update_bandwidth(Some(config)).is_err());
             assert_eq!(limiter.managed_state(), before);
@@ -1037,5 +1450,4 @@ pub(crate) mod unit_tests {
         assert!(!limiter.managed_event_handler().unwrap());
         assert!(limiter.event_handler().is_err());
     }
-
 }
