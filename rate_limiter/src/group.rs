@@ -321,6 +321,87 @@ pub(crate) mod unit_tests {
     }
 
     #[test]
+    fn live_external_consumers_share_debt_and_changed_policy_wakes_all() {
+        let group = RateLimiterGroup::new("disk-a", 100, 0, 1_000_000, 0, 0, 0).unwrap();
+        let first = group.new_handle().unwrap();
+        let second = group.new_handle().unwrap();
+        assert!(first.consume(60, TokenType::Bytes));
+        assert!(!second.consume(60, TokenType::Bytes));
+        first.account_transferred(100, 0).unwrap();
+        assert_eq!(group.state().bandwidth.debt, 60);
+        assert!(group.is_externally_driven());
+        assert!(group.update_bandwidth(None).unwrap());
+        assert!(!first.is_blocked());
+        assert_eq!(first.eventfd.read().unwrap(), 1);
+        assert_eq!(second.eventfd.read().unwrap(), 1);
+        assert!(
+            group
+                .update_bandwidth(Some(crate::BucketConfig {
+                    size: 200,
+                    one_time_burst: 2000,
+                    refill_time: 1_000_000,
+                }))
+                .unwrap()
+        );
+        assert_eq!(group.state().bandwidth.debt, 60);
+        assert_eq!(group.state().bandwidth.burst, 0);
+        assert!(second.is_blocked());
+    }
+
+    #[test]
+    fn live_unchanged_group_never_notifies_or_renews_credit() {
+        let group = RateLimiterGroup::new("net-rx", 100, 1000, 1_000_000, 0, 0, 0).unwrap();
+        let handle = group.new_handle().unwrap();
+        handle.account_transferred(1200, 1).unwrap();
+        let before = group.state();
+        assert!(
+            !group
+                .update_bandwidth(Some(crate::BucketConfig {
+                    size: 100,
+                    one_time_burst: 1000,
+                    refill_time: 1_000_000,
+                }))
+                .unwrap()
+        );
+        assert_eq!(group.state(), before);
+        assert_eq!(
+            handle.eventfd.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        handle.event_handler().unwrap();
+        group.process_timer().unwrap();
+        assert_eq!(group.state(), before);
+    }
+
+    #[test]
+    fn live_notification_saturation_is_already_pending() {
+        let group = RateLimiterGroup::new("net-tx", 100, 0, 1_000_000, 0, 0, 0).unwrap();
+        let handle = group.new_handle().unwrap();
+        handle.eventfd.write(u64::MAX - 1).unwrap();
+        assert!(group.update_bandwidth(None).unwrap());
+        assert_eq!(handle.eventfd.read().unwrap(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn live_external_timer_broadcasts_to_every_queue() {
+        let group = RateLimiterGroup::new("net-rx", 100, 0, 10, 0, 0, 0).unwrap();
+        let first = group.new_handle().unwrap();
+        let second = group.new_handle().unwrap();
+        first.account_transferred(200, 0).unwrap();
+        let mut poll = libc::pollfd {
+            fd: group.timer_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized pollfd for a live timer.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+        group.process_timer().unwrap();
+        assert!(!second.is_blocked());
+        assert_eq!(first.eventfd.read().unwrap(), 1);
+        assert_eq!(second.eventfd.read().unwrap(), 1);
+    }
+
+    #[test]
     fn test_rate_limiter_group_new() {
         let l = RateLimiterGroup::new("test", 1000, 1001, 1002, 1003, 1004, 1005).unwrap();
         let h = l.new_handle().unwrap();
