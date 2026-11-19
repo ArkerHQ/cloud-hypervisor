@@ -1701,7 +1701,7 @@ components:
                     type: string
                     nullable: true
               - type: object
-                required: [target, id, members, limiter]
+                required: [target, id, members, failed_members, limiter]
                 properties:
                   target:
                     type: string
@@ -1709,6 +1709,10 @@ components:
                   id:
                     type: string
                   members:
+                    type: array
+                    items:
+                      type: string
+                  failed_members:
                     type: array
                     items:
                       type: string

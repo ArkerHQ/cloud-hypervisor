@@ -762,10 +762,19 @@ impl Block {
         self.rate_limiter.clone()
     }
 
+    pub fn rate_failure(&self) -> Option<&'static str> {
+        crate::rate_device_failure(&self.common, &self.device_status)
+    }
+
     pub fn rate_queue_counts(&self) -> (usize, usize) {
         (
             self.common.queue_sizes.len(),
-            self.common.epoll_threads.as_ref().map_or(0, Vec::len),
+            self.common.epoll_threads.as_ref().map_or(0, |threads| {
+                threads
+                    .iter()
+                    .filter(|thread| !thread.is_finished())
+                    .count()
+            }),
         )
     }
 

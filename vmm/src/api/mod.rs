@@ -676,6 +676,7 @@ pub enum VmRateLimitsState {
     BlockGroup {
         id: String,
         members: Vec<String>,
+        failed_members: Vec<String>,
         limiter: EffectiveRateLimiter,
     },
     Net {

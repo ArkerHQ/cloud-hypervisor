@@ -5211,7 +5211,7 @@ impl DeviceManager {
                     queues,
                     active_queues: Some(active),
                     limiter: Some(group.state().into()),
-                    unsupported_reason: None,
+                    unsupported_reason: block.rate_failure().map(str::to_owned),
                 })
             }
             Some(RateControl::Net(net)) => {
@@ -5224,9 +5224,11 @@ impl DeviceManager {
                     active_queue_pairs: Some(active),
                     rx: groups.as_ref().map(|groups| groups.rx.state().into()),
                     tx: groups.as_ref().map(|groups| groups.tx.state().into()),
-                    unsupported_reason: groups
-                        .is_none()
-                        .then(|| "legacy_per_queue_config".to_owned()),
+                    unsupported_reason: net.rate_failure().map(str::to_owned).or_else(|| {
+                        groups
+                            .is_none()
+                            .then(|| "legacy_per_queue_config".to_owned())
+                    }),
                 })
             }
             None => {
@@ -5292,12 +5294,20 @@ impl DeviceManager {
             })?;
         match (update, &device.rate_control) {
             (VmRateLimitsRequest::Disk { bandwidth, .. }, Some(RateControl::Block(block))) => {
-                let group = block.lock().unwrap().rate_limiter_group().ok_or_else(|| {
+                let block = block.lock().unwrap();
+                if let Some(reason) = block.rate_failure() {
+                    return Err(DeviceManagerError::RateLimitsUnsupported {
+                        id: id.to_owned(),
+                        reason,
+                    });
+                }
+                let group = block.rate_limiter_group().ok_or_else(|| {
                     DeviceManagerError::RateLimitsUnsupported {
                         id: id.to_owned(),
                         reason: "missing_consumer_group",
                     }
                 })?;
+                drop(block);
                 if let Some(group_id) = self.named_rate_group(&group) {
                     return Err(DeviceManagerError::RateLimitsSharedGroup {
                         id: id.to_owned(),
@@ -5329,12 +5339,20 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::RateLimitsUpdate)
             }
             (VmRateLimitsRequest::Net { rx, tx, .. }, Some(RateControl::Net(net))) => {
-                let groups = net.lock().unwrap().rate_limiter_groups().ok_or_else(|| {
+                let net = net.lock().unwrap();
+                if let Some(reason) = net.rate_failure() {
+                    return Err(DeviceManagerError::RateLimitsUnsupported {
+                        id: id.to_owned(),
+                        reason,
+                    });
+                }
+                let groups = net.rate_limiter_groups().ok_or_else(|| {
                     DeviceManagerError::RateLimitsUnsupported {
                         id: id.to_owned(),
                         reason: "legacy_per_queue_config",
                     }
                 })?;
+                drop(net);
                 let mut config = self.config.lock().unwrap();
                 let saved = config
                     .net
@@ -5386,15 +5404,27 @@ impl DeviceManager {
             .collect();
         let mut groups: Vec<_> = self.rate_limit_groups.iter().collect();
         groups.sort_by_key(|(id, _)| *id);
-        targets.extend(
-            groups
-                .into_iter()
-                .map(|(id, group)| VmRateLimitsState::BlockGroup {
-                    id: id.clone(),
-                    members: self.rate_group_members(group),
-                    limiter: group.state().into(),
-                }),
-        );
+        targets.extend(groups.into_iter().map(|(id, group)| {
+            VmRateLimitsState::BlockGroup {
+                id: id.clone(),
+                members: self.rate_group_members(group),
+                failed_members: self
+                    .virtio_devices
+                    .iter()
+                    .filter_map(|device| {
+                        let Some(RateControl::Block(block)) = &device.rate_control else {
+                            return None;
+                        };
+                        let block = block.lock().unwrap();
+                        block
+                            .rate_limiter_group()
+                            .filter(|candidate| Arc::ptr_eq(candidate, group))
+                            .and_then(|_| block.rate_failure().map(|_| device.id().to_owned()))
+                    })
+                    .collect(),
+                limiter: group.state().into(),
+            }
+        }));
         if let Some(update) = update {
             targets.retain(|state| match (&update, state) {
                 (

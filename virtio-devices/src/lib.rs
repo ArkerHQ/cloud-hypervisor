@@ -70,6 +70,23 @@ const DEVICE_FEATURES_OK: u32 = 0x08;
 const DEVICE_NEEDS_RESET: u32 = 0x40;
 const DEVICE_FAILED: u32 = 0x80;
 
+pub(crate) fn rate_device_failure(
+    common: &VirtioCommon,
+    status: &AtomicU8,
+) -> Option<&'static str> {
+    if u32::from(status.load(Ordering::Acquire)) & (DEVICE_NEEDS_RESET | DEVICE_FAILED) != 0 {
+        Some("device_needs_reset")
+    } else if common
+        .epoll_threads
+        .as_ref()
+        .is_some_and(|threads| threads.iter().any(std::thread::JoinHandle::is_finished))
+    {
+        Some("queue_driver_exited")
+    } else {
+        None
+    }
+}
+
 /// Marks a virtio device as `NEEDS_RESET` and notifies the guest via a config
 /// change interrupt. Used when a guest induced error (corrupted virtqueue,
 /// malformed descriptor chain or similar) is detected and the worker thread
@@ -228,4 +245,41 @@ pub fn get_host_address_range<M: GuestMemory + ?Sized>(
     }
     let slice = mem.get_slice(addr, size).ok()?;
     Some(slice.ptr_guard_mut().as_ptr())
+}
+
+#[cfg(test)]
+mod live_rate_health_tests {
+    use super::*;
+
+    #[test]
+    fn rate_failure_uses_existing_reset_status_and_retained_thread_state() {
+        let mut common = VirtioCommon::default();
+        let status = AtomicU8::new(0);
+        assert_eq!(rate_device_failure(&common, &status), None);
+        status.store(DEVICE_NEEDS_RESET as u8, Ordering::Release);
+        assert_eq!(
+            rate_device_failure(&common, &status),
+            Some("device_needs_reset")
+        );
+        status.store(0, Ordering::Release);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        common.epoll_threads = Some(vec![std::thread::spawn(move || {
+            receiver.recv().unwrap();
+        })]);
+        assert_eq!(rate_device_failure(&common, &status), None);
+        sender.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !common.epoll_threads.as_ref().unwrap()[0].is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            rate_device_failure(&common, &status),
+            Some("queue_driver_exited")
+        );
+        for thread in common.epoll_threads.take().unwrap() {
+            thread.join().unwrap();
+        }
+        assert_eq!(rate_device_failure(&common, &status), None);
+    }
 }
