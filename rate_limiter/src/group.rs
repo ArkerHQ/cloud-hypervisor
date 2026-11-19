@@ -92,7 +92,7 @@ impl RateLimiterGroupHandle {
     ///
     /// # Errors
     ///
-    /// If the rate limiter is disabled or is not blocked, an error is returned.
+    /// Stale nonblocking readiness is benign.
     pub fn event_handler(&self) -> Result<(), Error> {
         match self.eventfd.read() {
             Ok(_) => Ok(()),
@@ -510,6 +510,17 @@ pub(crate) mod unit_tests {
         assert_eq!(peer.eventfd.read().unwrap(), 1);
     }
 
+    fn wait_for_handle_event(handle: &RateLimiterGroupHandle) {
+        let mut poll = libc::pollfd {
+            fd: handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized pollfd for a subscribed handle.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+        handle.event_handler().unwrap();
+    }
+
     fn wait_for_external_timer(group: &RateLimiterGroup) {
         let mut poll = libc::pollfd {
             fd: group.timer_fd(),
@@ -546,6 +557,15 @@ pub(crate) mod unit_tests {
 
         // consume 123 bytes
         assert!(h.consume(123, TokenType::Bytes));
+        h.inner
+            .rate_limiter
+            .inner
+            .lock()
+            .unwrap()
+            .bandwidth
+            .as_mut()
+            .unwrap()
+            .last_update = std::time::Instant::now() + Duration::from_secs(60);
         h.manual_replenish(23, TokenType::Bytes);
         {
             let bytes_tb = h.bandwidth().unwrap();
@@ -553,6 +573,15 @@ pub(crate) mod unit_tests {
         }
         // consume 123 ops
         assert!(h.consume(123, TokenType::Ops));
+        h.inner
+            .rate_limiter
+            .inner
+            .lock()
+            .unwrap()
+            .ops
+            .as_mut()
+            .unwrap()
+            .last_update = std::time::Instant::now() + Duration::from_secs(60);
         h.manual_replenish(23, TokenType::Ops);
         {
             let bytes_tb = h.ops().unwrap();
@@ -589,7 +618,7 @@ pub(crate) mod unit_tests {
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
         // the timer_fd should have an event on it by now
-        h.event_handler().unwrap();
+        wait_for_handle_event(&h);
         // limiter should now be unblocked
         assert!(!h.is_blocked());
         // try and succeed on another 100 bytes this time
@@ -625,7 +654,7 @@ pub(crate) mod unit_tests {
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
         // the timer_fd should have an event on it by now
-        h.event_handler().unwrap();
+        wait_for_handle_event(&h);
         // limiter should now be unblocked
         assert!(!h.is_blocked());
         // try and succeed on another 100 ops this time
@@ -662,7 +691,7 @@ pub(crate) mod unit_tests {
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
         // the timer_fd should have an event on it by now
-        h.event_handler().unwrap();
+        wait_for_handle_event(&h);
         // limiter should now be unblocked
         assert!(!h.is_blocked());
         // try and succeed on another 100 ops this time
@@ -692,7 +721,7 @@ pub(crate) mod unit_tests {
         // after 1.5x the replenish time has passed, the rate limiter
         // is available again
         thread::sleep(Duration::from_millis(500));
-        h.event_handler().unwrap();
+        wait_for_handle_event(&h);
         assert!(!h.is_blocked());
 
         // reset the rate limiter
@@ -726,8 +755,13 @@ pub(crate) mod unit_tests {
         // after waiting out the full duration, rate limiter should be
         // available again
         thread::sleep(Duration::from_millis(200));
-        h.event_handler().unwrap();
+        wait_for_handle_event(&h);
         assert!(!h.is_blocked());
-        assert!(h.consume(100, TokenType::Bytes));
+        assert_eq!(l.state().bandwidth.debt, 0);
+        // Debt repayment does not also replenish ordinary credit.
+        if !h.consume(100, TokenType::Bytes) {
+            wait_for_handle_event(&h);
+            assert!(h.consume(100, TokenType::Bytes));
+        }
     }
 }
