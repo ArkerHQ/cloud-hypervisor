@@ -457,6 +457,11 @@ impl RateLimiterInner {
                 }
             }
         }
+        // Only the timer driver may retire an existing block. A late completed
+        // transfer or rollback must leave readiness for sleeping peer queues.
+        if delay.is_none() && flag.load(Ordering::Acquire) {
+            delay = Some(Duration::from_nanos(1));
+        }
         self.timer_fd.reset(delay.unwrap_or(Duration::ZERO), None)?;
         flag.store(delay.is_some(), Ordering::Release);
         Ok(())
@@ -638,6 +643,7 @@ impl RateLimiter {
                 Err(error) => return Err(error),
             }
         }
+        self.timer_active.store(false, Ordering::Release);
         inner.reschedule_managed(now, &self.timer_active)?;
         Ok(true)
     }
@@ -744,6 +750,7 @@ impl RateLimiter {
             }
         }
         let now = Instant::now();
+        self.timer_active.store(false, Ordering::Release);
         inner.settle_managed(now);
         inner.reschedule_managed(now, &self.timer_active)?;
         Ok(!self.is_blocked())

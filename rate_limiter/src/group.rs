@@ -479,6 +479,49 @@ pub(crate) mod unit_tests {
     }
 
     #[test]
+    fn live_late_completed_packet_cannot_cancel_sleeping_peers_wake() {
+        let group = RateLimiterGroup::new("net-rx", 100, 0, 1000, 0, 0, 0).unwrap();
+        let first = group.new_handle().unwrap();
+        let peer = group.new_handle().unwrap();
+        first.account_transferred(200, 0).unwrap();
+        {
+            let mut inner = group.inner.rate_limiter.inner.lock().unwrap();
+            inner.bandwidth.as_mut().unwrap().last_update =
+                std::time::Instant::now() - Duration::from_secs(2);
+        }
+        first.account_transferred(1, 0).unwrap();
+        assert_eq!(group.state().bandwidth.debt, 0);
+        assert!(peer.is_blocked());
+        wait_for_external_timer(&group);
+        assert!(!peer.is_blocked());
+        assert_eq!(peer.eventfd.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn live_rollback_cannot_cancel_sleeping_peers_wake() {
+        let group = RateLimiterGroup::new("disk-a", 100, 0, 1_000_000, 0, 0, 0).unwrap();
+        let first = group.new_handle().unwrap();
+        let peer = group.new_handle().unwrap();
+        assert!(first.consume(101, TokenType::Bytes));
+        first.manual_replenish(101, TokenType::Bytes);
+        assert_eq!(group.state().bandwidth.debt, 0);
+        wait_for_external_timer(&group);
+        assert!(!peer.is_blocked());
+        assert_eq!(peer.eventfd.read().unwrap(), 1);
+    }
+
+    fn wait_for_external_timer(group: &RateLimiterGroup) {
+        let mut poll = libc::pollfd {
+            fd: group.timer_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized pollfd for a live timer.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+        group.process_timer().unwrap();
+    }
+
+    #[test]
     fn test_rate_limiter_group_new() {
         let l = RateLimiterGroup::new("test", 1000, 1001, 1002, 1003, 1004, 1005).unwrap();
         let h = l.new_handle().unwrap();
