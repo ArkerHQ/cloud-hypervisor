@@ -1756,6 +1756,53 @@ impl ApiAction for VmNmi {
 
 #[cfg(test)]
 mod unit_tests {
+    use super::{BandwidthPatch, VmRateLimitsRequest};
+
+    #[test]
+    fn live_rate_omission_is_distinct_from_explicit_unlimited() {
+        let omitted: VmRateLimitsRequest =
+            serde_json::from_str(r#"{"target":"net","id":"actual-nic"}"#).unwrap();
+        let explicit: VmRateLimitsRequest =
+            serde_json::from_str(r#"{"target":"net","id":"actual-nic","rx":{"mode":"unlimited"}}"#)
+                .unwrap();
+        assert!(matches!(
+            omitted,
+            VmRateLimitsRequest::Net {
+                rx: BandwidthPatch::Unchanged,
+                tx: BandwidthPatch::Unchanged,
+                ..
+            }
+        ));
+        assert!(matches!(
+            explicit,
+            VmRateLimitsRequest::Net {
+                rx: BandwidthPatch::Unlimited,
+                tx: BandwidthPatch::Unchanged,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_rate_patch_rejects_null_unknown_mixed_and_invalid_finite_axes() {
+        for value in [
+            serde_json::json!({"target":"disk", "id":"root-data", "bandwidth":null}),
+            serde_json::json!({"target":"disk", "id":"root-data", "bandwidth":{"mode":"unchanged"}}),
+            serde_json::json!({"target":"net", "id":"data-net", "rx":{"mode":"unlimited", "bucket":{"size":1}}}),
+            serde_json::json!({"target":"net", "id":"data-net", "tx":{"mode":"unlimited"}, "typo":0}),
+        ] {
+            assert!(serde_json::from_value::<VmRateLimitsRequest>(value).is_err());
+        }
+        for (size, refill_time) in [(0, 1000), (100, 0), (100, u64::MAX)] {
+            let request: VmRateLimitsRequest = serde_json::from_value(serde_json::json!({
+                "target":"net", "id":"data-net",
+                "rx":{"mode":"limited", "bucket":{"size":100,"refill_time":1000}},
+                "tx":{"mode":"limited", "bucket":{"size":size,"refill_time":refill_time}}
+            }))
+            .unwrap();
+            assert!(request.validate().is_err());
+        }
+    }
     use super::*;
 
     #[test]
