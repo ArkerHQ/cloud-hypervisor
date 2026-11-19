@@ -2770,37 +2770,16 @@ impl DeviceManager {
                 warn!("Enabling backing_files option only applies for QCOW2 files");
             }
 
-            let rate_limit_group =
-                if let Some(rate_limiter_cfg) = disk_cfg.rate_limiter_config.as_ref() {
-                    // Create an anonymous RateLimiterGroup that is dropped when the Disk
-                    // is dropped.
-                    let bw = rate_limiter_cfg.bandwidth.unwrap_or_default();
-                    let ops = rate_limiter_cfg.ops.unwrap_or_default();
-                    let mut rate_limit_group = RateLimiterGroup::new(
-                        disk_cfg.pci_common.id.as_ref().unwrap(),
-                        bw.size,
-                        bw.one_time_burst.unwrap_or(0),
-                        bw.refill_time,
-                        ops.size,
-                        ops.one_time_burst.unwrap_or(0),
-                        ops.refill_time,
-                    )
-                    .map_err(DeviceManagerError::RateLimiterGroupCreate)?;
-
-                    rate_limit_group
-                        .start_thread(
-                            self.exit_evt
-                                .try_clone()
-                                .map_err(DeviceManagerError::EventFd)?,
-                        )
-                        .unwrap();
-
-                    Some(Arc::new(rate_limit_group))
-                } else if let Some(rate_limit_group) = disk_cfg.rate_limit_group.as_ref() {
-                    self.rate_limit_groups.get(rate_limit_group).cloned()
-                } else {
-                    None
-                };
+            let rate_limit_group = if let Some(group) = disk_cfg.rate_limit_group.as_ref() {
+                self.rate_limit_groups.get(group).cloned()
+            } else {
+                let config = disk_cfg.rate_limiter_config.unwrap_or_default();
+                Some(Arc::new(
+                    config
+                        .create_group(&id)
+                        .map_err(DeviceManagerError::RateLimiterGroupCreate)?,
+                ))
+            };
 
             let queue_affinity = if let Some(queue_affinity) = disk_cfg.queue_affinity.as_ref() {
                 queue_affinity

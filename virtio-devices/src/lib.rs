@@ -156,6 +156,43 @@ pub struct RateLimiterConfig {
     pub ops: Option<TokenBucketConfig>,
 }
 
+/// Preserve legacy per-pair network limits while making aggregate axes explicit.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum NetRateLimiterConfig {
+    Legacy(RateLimiterConfig),
+    Aggregate {
+        rx: RateLimiterConfig,
+        tx: RateLimiterConfig,
+    },
+}
+
+impl RateLimiterConfig {
+    pub fn is_enabled(&self) -> bool {
+        [self.bandwidth, self.ops]
+            .into_iter()
+            .flatten()
+            .any(|bucket| bucket.size != 0 && bucket.refill_time != 0)
+    }
+
+    pub fn create_group(
+        &self,
+        id: &str,
+    ) -> Result<rate_limiter::group::RateLimiterGroup, rate_limiter::group::Error> {
+        let bandwidth = self.bandwidth.unwrap_or_default();
+        let ops = self.ops.unwrap_or_default();
+        rate_limiter::group::RateLimiterGroup::new(
+            id,
+            bandwidth.size,
+            bandwidth.one_time_burst.unwrap_or(0),
+            bandwidth.refill_time,
+            ops.size,
+            ops.one_time_burst.unwrap_or(0),
+            ops.refill_time,
+        )
+    }
+}
+
 impl TryInto<rate_limiter::RateLimiter> for RateLimiterConfig {
     type Error = io::Error;
 

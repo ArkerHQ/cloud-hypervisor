@@ -32,7 +32,9 @@ type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 pub use ctrl_queue::{CtrlQueue, Error as CtrlQueueError};
 pub use mac::{MAC_ADDR_LEN, MacAddr};
 pub use open_tap::{Error as OpenTapError, open_tap};
-pub use queue_pair::{NetCounters, NetQueuePair, NetQueuePairError, RxVirtio, TxVirtio};
+pub use queue_pair::{
+    NetCounters, NetQueuePair, NetQueuePairError, NetRateLimiter, RxVirtio, TxVirtio,
+};
 pub use tap::{Error as TapError, Tap};
 
 #[derive(Error, Debug)]

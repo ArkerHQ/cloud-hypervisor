@@ -20,9 +20,11 @@ use log::{debug, error, info, warn};
 #[cfg(not(fuzzing))]
 use net_util::virtio_features_to_tap_offload;
 use net_util::{
-    CtrlQueue, MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap, TapError, TxVirtio,
-    VirtioNetConfig, build_net_config_space, build_net_config_space_with_mq, open_tap,
+    CtrlQueue, MacAddr, NetCounters, NetQueuePair, NetRateLimiter, OpenTapError, RxVirtio, Tap,
+    TapError, TxVirtio, VirtioNetConfig, build_net_config_space, build_net_config_space_with_mq,
+    open_tap,
 };
+use rate_limiter::group::RateLimiterGroup;
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -37,8 +39,8 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::{
     ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
-    EpollHelperHandler, Error as DeviceError, RateLimiterConfig, VirtioCommon, VirtioDevice,
-    VirtioDeviceType, VirtioInterruptType,
+    EpollHelperHandler, Error as DeviceError, NetRateLimiterConfig, RateLimiterConfig,
+    VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterruptType,
 };
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
@@ -152,9 +154,20 @@ pub const TX_TAP_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
 pub const RX_RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
 // New 'wake up' event from the tx rate limiter
 pub const TX_RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 6;
+const RX_GROUP_TIMER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 7;
+const TX_GROUP_TIMER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 8;
+
+/// The exact group owners consumed by every queue pair of this device.
+#[derive(Clone)]
+pub struct NetRateLimiterGroups {
+    pub rx: Arc<RateLimiterGroup>,
+    pub tx: Arc<RateLimiterGroup>,
+}
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("Failed to create aggregate network rate limiter")]
+    RateLimiter(#[source] rate_limiter::group::Error),
     #[error("Failed to open taps")]
     OpenTap(#[source] OpenTapError),
     #[error("Using existing tap")]
@@ -174,6 +187,7 @@ struct NetEpollHandler {
     queue_index_base: u16,
     queue_pair: (Queue, Queue),
     queue_evt_pair: (EventFd, EventFd),
+    rate_timer_groups: Option<NetRateLimiterGroups>,
 }
 
 impl NetEpollHandler {
@@ -274,6 +288,11 @@ impl NetEpollHandler {
             helper.add_event(rate_limiter.as_raw_fd(), TX_RATE_LIMITER_EVENT)?;
         }
 
+        if let Some(groups) = &self.rate_timer_groups {
+            helper.add_event(groups.rx.timer_fd(), RX_GROUP_TIMER_EVENT)?;
+            helper.add_event(groups.tx.timer_fd(), TX_GROUP_TIMER_EVENT)?;
+        }
+
         let mem = self.mem.memory();
         // If there are some already available descriptors on the RX queue,
         // then we can start the thread while listening onto the TAP.
@@ -336,6 +355,21 @@ impl EpollHelperHandler for NetEpollHandler {
                     EpollHelperError::HandleEvent(anyhow!("Error processing tap queue: {e:?}"))
                 })?;
             }
+            RX_GROUP_TIMER_EVENT | TX_GROUP_TIMER_EVENT => {
+                let groups = self.rate_timer_groups.as_ref().ok_or_else(|| {
+                    EpollHelperError::HandleEvent(anyhow!("Unexpected aggregate timer event"))
+                })?;
+                let group = if ev_type == RX_GROUP_TIMER_EVENT {
+                    &groups.rx
+                } else {
+                    &groups.tx
+                };
+                group.process_timer().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to service aggregate rate timer: {e}"
+                    ))
+                })?;
+            }
             RX_RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.net.rx_rate_limiter {
                     // Upon rate limiter event, call the rate limiter handler and register the
@@ -346,7 +380,10 @@ impl EpollHelperHandler for NetEpollHandler {
                         ))
                     })?;
 
-                    if !self.net.rx_tap_listening && self.net.rx_desc_avail {
+                    if !rate_limiter.is_blocked()
+                        && !self.net.rx_tap_listening
+                        && self.net.rx_desc_avail
+                    {
                         net_util::register_listener(
                             self.net.epoll_fd.unwrap(),
                             self.net.tap.as_raw_fd(),
@@ -376,9 +413,13 @@ impl EpollHelperHandler for NetEpollHandler {
                             "Error from 'rate_limiter.event_handler()': {e:?}"
                         ))
                     })?;
-                    self.process_tx().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!("Error processing TX queue: {e:?}"))
-                    })?;
+                    if !rate_limiter.is_blocked() {
+                        self.process_tx().map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Error processing TX queue: {e:?}"
+                            ))
+                        })?;
+                    }
                 } else {
                     return Err(EpollHelperError::HandleEvent(anyhow!(
                         "Unexpected TX_RATE_LIMITER_EVENT"
@@ -403,7 +444,8 @@ pub struct Net {
     ctrl_queue_epoll_thread: Option<thread::JoinHandle<()>>,
     counters: NetCounters,
     seccomp_action: SeccompAction,
-    rate_limiter_config: Option<RateLimiterConfig>,
+    rate_limiter_config: Option<NetRateLimiterConfig>,
+    rate_groups: Option<NetRateLimiterGroups>,
     exit_evt: EventFd,
     device_status: Arc<AtomicU8>,
 }
@@ -417,6 +459,11 @@ pub struct NetState {
 }
 
 impl Net {
+    /// Control references to the actual aggregate consumer owners, when supported.
+    pub fn rate_limiter_groups(&self) -> Option<NetRateLimiterGroups> {
+        self.rate_groups.clone()
+    }
+
     /// Create a new virtio network device with the given TAP interface.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_tap(
@@ -427,7 +474,7 @@ impl Net {
         num_queues: usize,
         queue_size: u16,
         seccomp_action: SeccompAction,
-        rate_limiter_config: Option<RateLimiterConfig>,
+        rate_limiter_config: Option<NetRateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
         offload_tso: bool,
@@ -506,6 +553,21 @@ impl Net {
             )
         };
 
+        let aggregate = match rate_limiter_config {
+            Some(NetRateLimiterConfig::Legacy(config)) if config.is_enabled() => None,
+            Some(NetRateLimiterConfig::Legacy(config)) => Some((config, config)),
+            Some(NetRateLimiterConfig::Aggregate { rx, tx }) => Some((rx, tx)),
+            None => Some((RateLimiterConfig::default(), RateLimiterConfig::default())),
+        };
+        let rate_groups = aggregate
+            .map(|(rx, tx)| -> Result<_> {
+                Ok(NetRateLimiterGroups {
+                    rx: Arc::new(rx.create_group(&id).map_err(Error::RateLimiter)?),
+                    tx: Arc::new(tx.create_group(&id).map_err(Error::RateLimiter)?),
+                })
+            })
+            .transpose()?;
+
         Ok(Net {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Net as u32,
@@ -524,6 +586,7 @@ impl Net {
             counters: NetCounters::default(),
             seccomp_action,
             rate_limiter_config,
+            rate_groups,
             exit_evt,
             device_status: Arc::new(AtomicU8::new(0)),
         })
@@ -544,7 +607,7 @@ impl Net {
         num_queues: usize,
         queue_size: u16,
         seccomp_action: SeccompAction,
-        rate_limiter_config: Option<RateLimiterConfig>,
+        rate_limiter_config: Option<NetRateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
         offload_tso: bool,
@@ -588,7 +651,7 @@ impl Net {
         access_platform_enabled: bool,
         queue_size: u16,
         seccomp_action: SeccompAction,
-        rate_limiter_config: Option<RateLimiterConfig>,
+        rate_limiter_config: Option<NetRateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
         offload_tso: bool,
@@ -757,17 +820,38 @@ impl VirtioDevice for Net {
 
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
-            let rx_rate_limiter: Option<rate_limiter::RateLimiter> = self
-                .rate_limiter_config
-                .map(RateLimiterConfig::try_into)
-                .transpose()
-                .map_err(ActivateError::CreateRateLimiter)?;
-
-            let tx_rate_limiter: Option<rate_limiter::RateLimiter> = self
-                .rate_limiter_config
-                .map(RateLimiterConfig::try_into)
-                .transpose()
-                .map_err(ActivateError::CreateRateLimiter)?;
+            let (rx_rate_limiter, tx_rate_limiter) = if let Some(groups) = &self.rate_groups {
+                (
+                    Some(NetRateLimiter::Group(
+                        groups
+                            .rx
+                            .new_handle()
+                            .map_err(|_| ActivateError::BadActivate)?,
+                    )),
+                    Some(NetRateLimiter::Group(
+                        groups
+                            .tx
+                            .new_handle()
+                            .map_err(|_| ActivateError::BadActivate)?,
+                    )),
+                )
+            } else {
+                let Some(NetRateLimiterConfig::Legacy(config)) = self.rate_limiter_config else {
+                    return Err(ActivateError::BadActivate);
+                };
+                (
+                    Some(NetRateLimiter::Local(
+                        config
+                            .try_into()
+                            .map_err(ActivateError::CreateRateLimiter)?,
+                    )),
+                    Some(NetRateLimiter::Local(
+                        config
+                            .try_into()
+                            .map_err(ActivateError::CreateRateLimiter)?,
+                    )),
+                )
+            };
 
             let tap = taps.remove(0);
             #[cfg(not(fuzzing))]
@@ -794,6 +878,7 @@ impl VirtioDevice for Net {
                     tx_rate_limiter,
                     access_platform: self.common.access_platform(),
                 },
+                rate_timer_groups: self.rate_groups.clone().filter(|_| i == 0),
                 mem: mem.clone(),
                 queue_index_base: (i * 2) as u16,
                 queue_pair,

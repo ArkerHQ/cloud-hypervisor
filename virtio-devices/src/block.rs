@@ -61,6 +61,7 @@ const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+const RATE_LIMITER_TIMER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
 
 // latency scale, for reduce precision loss in calculate.
 const LATENCY_SCALE: u64 = 10000;
@@ -163,6 +164,7 @@ struct BlockEpollHandler {
     queue_evt: EventFd,
     inflight_requests: VecDeque<(u16, Request)>,
     rate_limiter: Option<RateLimiterGroupHandle>,
+    rate_timer_group: Option<Arc<RateLimiterGroup>>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Vec<usize>>,
     acked_features: u64,
@@ -638,6 +640,9 @@ impl BlockEpollHandler {
         if let Some(rate_limiter) = &self.rate_limiter {
             helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
         }
+        if let Some(group) = &self.rate_timer_group {
+            helper.add_event(group.timer_fd(), RATE_LIMITER_TIMER_EVENT)?;
+        }
         self.set_queue_thread_affinity();
         helper.run(paused, paused_sync, self)?;
 
@@ -683,6 +688,16 @@ impl EpollHelperHandler for BlockEpollHandler {
                     self.process_queue_submit_and_signal()?;
                 }
             }
+            RATE_LIMITER_TIMER_EVENT => {
+                let group = self.rate_timer_group.as_ref().ok_or_else(|| {
+                    EpollHelperError::HandleEvent(anyhow!("Unexpected private rate timer event"))
+                })?;
+                group.process_timer().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to service private rate timer: {e}"
+                    ))
+                })?;
+            }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
                     // Upon rate limiter event, call the rate limiter handler
@@ -693,7 +708,9 @@ impl EpollHelperHandler for BlockEpollHandler {
                         ))
                     })?;
 
-                    self.process_queue_submit_and_signal()?;
+                    if !rate_limiter.is_blocked() {
+                        self.process_queue_submit_and_signal()?;
+                    }
                 } else {
                     return Err(EpollHelperError::HandleEvent(anyhow!(
                         "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
@@ -740,6 +757,11 @@ pub struct BlockState {
 }
 
 impl Block {
+    /// Control reference to the same group consumed by the block queues.
+    pub fn rate_limiter_group(&self) -> Option<Arc<RateLimiterGroup>> {
+        self.rate_limiter.clone()
+    }
+
     /// Create a new virtio block device that operates on the given file.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1143,6 +1165,10 @@ impl VirtioDevice for Block {
                 // This gives head room for systems with slower I/O without
                 // compromising the cost of the reallocation or memory overhead
                 inflight_requests: VecDeque::with_capacity(64),
+                rate_timer_group: self
+                    .rate_limiter
+                    .clone()
+                    .filter(|group| i == 0 && group.is_externally_driven()),
                 rate_limiter: self
                     .rate_limiter
                     .as_ref()

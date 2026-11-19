@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use log::{error, info};
+use rate_limiter::group::RateLimiterGroupHandle;
 use rate_limiter::{RateLimiter, TokenType};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
@@ -17,6 +18,60 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory};
 use vm_virtio::{AccessPlatform, Translatable};
 
 use super::{Tap, register_listener, unregister_listener, vnet_hdr_len};
+
+/// Legacy per-queue policy or one direction of a device-wide shared policy.
+pub enum NetRateLimiter {
+    Local(RateLimiter),
+    Group(RateLimiterGroupHandle),
+}
+
+impl NetRateLimiter {
+    pub fn is_blocked(&self) -> bool {
+        match self {
+            Self::Local(limiter) => limiter.is_blocked(),
+            Self::Group(limiter) => limiter.is_blocked(),
+        }
+    }
+
+    pub fn event_handler(&self) -> io::Result<()> {
+        match self {
+            Self::Local(limiter) => limiter.event_handler().map_err(io::Error::other),
+            Self::Group(limiter) => limiter.event_handler().map_err(io::Error::other),
+        }
+    }
+
+    fn group_blocked(&self) -> bool {
+        matches!(self, Self::Group(limiter) if limiter.is_blocked())
+    }
+
+    fn account_tap_result(&self, result: libc::ssize_t) -> io::Result<bool> {
+        match self {
+            Self::Group(limiter) if result > 0 => limiter
+                .account_transferred(result as u64, 1)
+                .map_err(io::Error::other),
+            Self::Group(limiter) => Ok(!limiter.is_blocked()),
+            Self::Local(_) => Ok(true),
+        }
+    }
+
+    fn account_legacy(&self, bytes: u64) -> bool {
+        match self {
+            Self::Local(limiter) => {
+                limiter.consume(1, TokenType::Ops) && limiter.consume(bytes, TokenType::Bytes)
+            }
+            Self::Group(_) => true,
+        }
+    }
+}
+
+impl AsRawFd for NetRateLimiter {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Local(limiter) => limiter.as_raw_fd(),
+            Self::Group(limiter) => limiter.as_raw_fd(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TxVirtio {
@@ -45,7 +100,7 @@ impl TxVirtio {
         mem: &vm_memory::GuestMemoryMmap<B>,
         tap: &Tap,
         queue: &mut Queue,
-        rate_limiter: &mut Option<RateLimiter>,
+        rate_limiter: &mut Option<NetRateLimiter>,
         access_platform: Option<&dyn AccessPlatform>,
     ) -> Result<bool, NetQueuePairError> {
         let mut retry_write = false;
@@ -58,7 +113,11 @@ impl TxVirtio {
             let Some(mut desc_chain) = iter.next() else {
                 break;
             };
-            if rate_limit_reached {
+            if rate_limit_reached
+                || rate_limiter
+                    .as_ref()
+                    .is_some_and(NetRateLimiter::group_blocked)
+            {
                 queue.go_to_previous_position();
                 break;
             }
@@ -124,6 +183,12 @@ impl TxVirtio {
                     )
                 };
 
+                if let Some(limiter) = rate_limiter {
+                    rate_limit_reached = !limiter
+                        .account_tap_result(result)
+                        .map_err(NetQueuePairError::RateLimiter)?;
+                }
+
                 if result < 0 {
                     let e = std::io::Error::last_os_error();
 
@@ -156,8 +221,7 @@ impl TxVirtio {
             // let the 'last' descriptor chain go-through even if it was over the rate
             // limit, and simply stop processing oncoming `avail_desc` if any.
             if let Some(rate_limiter) = rate_limiter {
-                rate_limit_reached = !rate_limiter.consume(1, TokenType::Ops)
-                    || !rate_limiter.consume(bytes_sent, TokenType::Bytes);
+                rate_limit_reached |= !rate_limiter.account_legacy(bytes_sent);
             }
 
             // TX descriptors are device-readable only; the device wrote
@@ -206,7 +270,7 @@ impl RxVirtio {
         mem: &vm_memory::GuestMemoryMmap<B>,
         tap: &Tap,
         queue: &mut Queue,
-        rate_limiter: &mut Option<RateLimiter>,
+        rate_limiter: &mut Option<NetRateLimiter>,
         access_platform: Option<&dyn AccessPlatform>,
     ) -> Result<bool, NetQueuePairError> {
         let mut exhausted_descs = true;
@@ -219,7 +283,11 @@ impl RxVirtio {
             let Some(mut desc_chain) = iter.next() else {
                 break;
             };
-            if rate_limit_reached {
+            if rate_limit_reached
+                || rate_limiter
+                    .as_ref()
+                    .is_some_and(NetRateLimiter::group_blocked)
+            {
                 exhausted_descs = false;
                 queue.go_to_previous_position();
                 break;
@@ -313,6 +381,13 @@ impl RxVirtio {
                         iovecs.len() as libc::c_int,
                     )
                 };
+
+                // Account immediately after TAP consumption, even if guest writeback fails.
+                if let Some(limiter) = rate_limiter {
+                    rate_limit_reached = !limiter
+                        .account_tap_result(result)
+                        .map_err(NetQueuePairError::RateLimiter)?;
+                }
                 if result < 0 {
                     let e = std::io::Error::last_os_error();
 
@@ -369,8 +444,7 @@ impl RxVirtio {
             // chain go-through even if it was over the rate limit, and simply stop
             // processing oncoming `avail_desc` if any.
             if let Some(rate_limiter) = rate_limiter {
-                rate_limit_reached = !rate_limiter.consume(1, TokenType::Ops)
-                    || !rate_limiter.consume(len as u64, TokenType::Bytes);
+                rate_limit_reached |= !rate_limiter.account_legacy(len as u64);
             }
 
             queue
@@ -446,6 +520,8 @@ pub struct NetCounters {
 
 #[derive(Error, Debug)]
 pub enum NetQueuePairError {
+    #[error("Error accounting completed TAP I/O")]
+    RateLimiter(#[source] io::Error),
     #[error("No memory configured")]
     NoMemoryConfigured,
     #[error("Error registering listener")]
@@ -490,8 +566,8 @@ pub struct NetQueuePair {
     pub tap_rx_event_id: u16,
     pub tap_tx_event_id: u16,
     pub rx_desc_avail: bool,
-    pub rx_rate_limiter: Option<RateLimiter>,
-    pub tx_rate_limiter: Option<RateLimiter>,
+    pub rx_rate_limiter: Option<NetRateLimiter>,
+    pub tx_rate_limiter: Option<NetRateLimiter>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
 }
 

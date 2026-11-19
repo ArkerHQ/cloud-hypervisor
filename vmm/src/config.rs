@@ -24,7 +24,7 @@ use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 use virtio_bindings::virtio_ids::*;
 use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
-use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
+use virtio_devices::{NetRateLimiterConfig, RateLimiterConfig, TokenBucketConfig};
 
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
@@ -1660,10 +1660,10 @@ impl NetConfig {
             None
         };
         let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
+            Some(NetRateLimiterConfig::Legacy(RateLimiterConfig {
                 bandwidth: bw_tb_config,
                 ops: ops_tb_config,
-            })
+            }))
         } else {
             None
         };
@@ -5297,7 +5297,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         invalid_config.net = Some(vec![NetConfig {
             vhost_user: true,
             vhost_socket: Some("/path/to/sock".to_owned()),
-            rate_limiter_config: Some(RateLimiterConfig::default()),
+            rate_limiter_config: Some(NetRateLimiterConfig::Legacy(RateLimiterConfig::default())),
             ..net_fixture()
         }]);
         assert_eq!(

@@ -14,7 +14,7 @@ use log::{debug, warn};
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use virtio_devices::RateLimiterConfig;
+use virtio_devices::{NetRateLimiterConfig, RateLimiterConfig};
 
 use crate::Landlock;
 use crate::landlock::LandlockError;
@@ -382,7 +382,7 @@ pub struct NetConfig {
     #[serde(default, deserialize_with = "deserialize_netconfig_fds")]
     pub fds: Option<Vec<i32>>,
     #[serde(default)]
-    pub rate_limiter_config: Option<RateLimiterConfig>,
+    pub rate_limiter_config: Option<NetRateLimiterConfig>,
     #[serde(default = "default_netconfig_true")]
     pub offload_tso: bool,
     #[serde(default = "default_netconfig_true")]
