@@ -1433,7 +1433,7 @@ pub(crate) mod unit_tests {
                 refill_time: u64::MAX,
             },
         ] {
-            assert!(limiter.update_bandwidth(Some(config)).is_err());
+            limiter.update_bandwidth(Some(config)).unwrap_err();
             assert_eq!(limiter.managed_state(), before);
         }
     }
