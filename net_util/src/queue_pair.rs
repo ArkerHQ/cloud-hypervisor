@@ -21,7 +21,7 @@ use super::{Tap, register_listener, unregister_listener, vnet_hdr_len};
 
 /// Legacy per-queue policy or one direction of a device-wide shared policy.
 pub enum NetRateLimiter {
-    Local(RateLimiter),
+    Local(Box<RateLimiter>),
     Group(RateLimiterGroupHandle),
 }
 
@@ -808,8 +808,9 @@ mod live_rate_tests {
 
     #[test]
     fn local_mode_keeps_legacy_post_transfer_accounting() {
-        let limiter =
-            NetRateLimiter::Local(RateLimiter::new(100, 0, 1_000_000, 1, 0, 1_000_000).unwrap());
+        let limiter = NetRateLimiter::Local(Box::new(
+            RateLimiter::new(100, 0, 1_000_000, 1, 0, 1_000_000).unwrap(),
+        ));
         assert!(limiter.account_tap_result(200).unwrap());
         assert!(!limiter.group_blocked());
         assert!(limiter.account_legacy(200));

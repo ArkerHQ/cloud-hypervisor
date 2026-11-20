@@ -861,16 +861,16 @@ impl VirtioDevice for Net {
                     return Err(ActivateError::BadActivate);
                 };
                 (
-                    Some(NetRateLimiter::Local(
+                    Some(NetRateLimiter::Local(Box::new(
                         config
                             .try_into()
                             .map_err(ActivateError::CreateRateLimiter)?,
-                    )),
-                    Some(NetRateLimiter::Local(
+                    ))),
+                    Some(NetRateLimiter::Local(Box::new(
                         config
                             .try_into()
                             .map_err(ActivateError::CreateRateLimiter)?,
-                    )),
+                    ))),
                 )
             };
 
