@@ -1606,11 +1606,10 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 };
                 if let Err(e) = fd.enable_cap(&arker_ec) {
                     warn!(
-                        "ARKER: nested-migration cap {} enable failed (non-fatal): {:?}",
-                        arker_cap, e
+                        "ARKER: nested-migration cap {arker_cap} enable failed (non-fatal): {e:?}"
                     );
                 } else {
-                    eprintln!("CHNESTED enabled nested-migration cap {}", arker_cap);
+                    eprintln!("CHNESTED enabled nested-migration cap {arker_cap}");
                 }
             }
 
@@ -3211,7 +3210,6 @@ impl cpu::Vcpu for KvmVcpu {
     #[cfg(target_arch = "aarch64")]
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
-        eprintln!("CHNESTED set_state nested_is_some={}", state.nested_state.is_some());
         // Set core registers
         self.set_regs(&state.core_regs.into())?;
         // Set system registers
@@ -3631,7 +3629,7 @@ impl KvmVcpu {
             .nested_state(&mut buffer)
             .map_err(|e| cpu::HypervisorCpuError::GetNestedState(e.into()))?;
 
-        eprintln!("CHNESTED GET maybe_size={:?}", maybe_size);
+        eprintln!("CHNESTED GET maybe_size={maybe_size:?}");
         if let Some(_size) = maybe_size {
             Ok(Some(buffer))
         } else {
@@ -3642,11 +3640,12 @@ impl KvmVcpu {
             // (#UD) -> kvm_spurious_fault -> vCPU wedge (AVD L2 hang after restore).
             // Preserve the vmxon-only header so SET_NESTED_STATE re-enters VMX
             // operation on restore. format 0 == KVM_STATE_NESTED_FORMAT_VMX.
+            // SAFETY: empty() initializes all union bytes before the successful
+            // ioctl. This u64 is valid for all bits and interpreted only for VMX below.
             let vmxon_pa = unsafe { buffer.hdr.vmx.vmxon_pa };
             if buffer.format == 0 && vmxon_pa != u64::MAX {
                 eprintln!(
-                    "CHNESTED GET header-only vmxon_pa={:#x} -> preserving vmxon-only state",
-                    vmxon_pa
+                    "CHNESTED GET header-only vmxon_pa={vmxon_pa:#x} -> preserving vmxon-only state"
                 );
                 Ok(Some(buffer))
             } else {
