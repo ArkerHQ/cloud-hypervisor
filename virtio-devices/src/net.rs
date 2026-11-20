@@ -470,12 +470,7 @@ impl Net {
     }
 
     pub fn rate_failure(&self) -> Option<&'static str> {
-        crate::rate_device_failure(&self.common, &self.device_status).or_else(|| {
-            self.ctrl_queue_epoll_thread
-                .as_ref()
-                .filter(|thread| thread.is_finished())
-                .map(|_| "control_queue_driver_exited")
-        })
+        crate::rate_device_failure(&self.common, &self.device_status)
     }
 
     pub fn rate_queue_pair_counts(&self) -> (usize, usize) {
