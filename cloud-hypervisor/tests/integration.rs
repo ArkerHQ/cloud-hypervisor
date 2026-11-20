@@ -11773,7 +11773,7 @@ PY"#
                         command.arg("-R");
                     }
                     if low_udp {
-                        command.args(["-u", "-b", "100M"]);
+                        command.args(["-u", "-b", "100M", "-l", "1024"]);
                     }
                     command.stdout(Stdio::null()).stderr(Stdio::inherit());
                     clients.0.push(command.spawn().unwrap());
