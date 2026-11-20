@@ -2031,6 +2031,82 @@ mod unit_tests {
     }
 
     #[test]
+    fn live_rate_patch_valid_wire_shapes_round_trip() {
+        for value in [
+            serde_json::json!({"mode":"unlimited"}),
+            serde_json::json!({"mode":"limited", "bucket":{
+                "size":100, "one_time_burst":50, "refill_time":1000
+            }}),
+        ] {
+            let patch: BandwidthPatch = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(patch).unwrap(), value);
+            for (target, axis) in [
+                ("disk", "bandwidth"),
+                ("block_group", "bandwidth"),
+                ("net", "rx"),
+                ("net", "tx"),
+            ] {
+                let mut request = serde_json::json!({"target":target, "id":"actual"});
+                request[axis] = value.clone();
+                let bytes = serde_json::to_vec(&request).unwrap();
+                let decoded: VmRateLimitsRequest = serde_json::from_slice(&bytes).unwrap();
+                decoded.validate().unwrap();
+                assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+            }
+        }
+        for target in ["disk", "block_group", "net"] {
+            let omitted = serde_json::json!({"target":target, "id":"actual"});
+            let request: VmRateLimitsRequest = serde_json::from_value(omitted.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), omitted);
+        }
+    }
+
+    #[test]
+    fn live_rate_unlimited_rejects_extra_fields_on_every_axis() {
+        for (field, value) in [
+            ("bucket", serde_json::Value::Null),
+            (
+                "bucket",
+                serde_json::json!({"size":100, "refill_time":1000}),
+            ),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let mut patch = serde_json::json!({"mode":"unlimited"});
+            patch[field] = value;
+            serde_json::from_value::<BandwidthPatch>(patch.clone()).unwrap_err();
+            let bytes = serde_json::to_vec(&patch).unwrap();
+            serde_json::from_slice::<BandwidthPatch>(&bytes).unwrap_err();
+            for (target, axis) in [
+                ("disk", "bandwidth"),
+                ("block_group", "bandwidth"),
+                ("net", "rx"),
+                ("net", "tx"),
+            ] {
+                let mut request = serde_json::json!({"target":target, "id":"actual"});
+                request[axis] = patch.clone();
+                let bytes = serde_json::to_vec(&request).unwrap();
+                serde_json::from_value::<VmRateLimitsRequest>(request).unwrap_err();
+                serde_json::from_slice::<VmRateLimitsRequest>(&bytes).unwrap_err();
+            }
+        }
+    }
+
+    #[test]
+    fn live_rate_limited_rejects_malformed_buckets() {
+        for bucket in [
+            serde_json::Value::Null,
+            serde_json::json!({"size":100}),
+            serde_json::json!({"size":"100", "refill_time":1000}),
+            serde_json::json!({"size":100, "refill_time":1000, "unknown":true}),
+        ] {
+            let patch = serde_json::json!({"mode":"limited", "bucket":bucket});
+            let bytes = serde_json::to_vec(&patch).unwrap();
+            serde_json::from_value::<BandwidthPatch>(patch).unwrap_err();
+            serde_json::from_slice::<BandwidthPatch>(&bytes).unwrap_err();
+        }
+    }
+
+    #[test]
     fn live_rate_patch_rejects_null_unknown_mixed_and_invalid_finite_axes() {
         for value in [
             serde_json::json!({"target":"disk", "id":"root-data", "bandwidth":null}),
