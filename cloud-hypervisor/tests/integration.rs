@@ -11287,8 +11287,8 @@ mod rate_limiter {
         let api_socket = temp_api_path(&guest.tmp_dir);
         let mut net = format!(
             "id=rate-data-net,tap=,mac={},ip={},mask=255.255.255.128,num_queues={},queue_size=256",
-            guest.network.guest_mac0,
-            guest.network.host_ip0,
+            guest.network.guest_mac1,
+            guest.network.host_ip1,
             queue_pairs * 2
         );
         if legacy_net {
@@ -11312,7 +11312,8 @@ mod rate_limiter {
                 ),
             ]);
         command.args(extra_disks);
-        command.args(["--net", &net, "--api-socket", &api_socket]);
+        let control = format!("id=rate-control-net,{}", guest.default_net_string());
+        command.args(["--net", &control, &net, "--api-socket", &api_socket]);
         if let Some(group) = group {
             command.args(["--rate-limit-group", group]);
         }
@@ -11511,7 +11512,12 @@ PY"#).unwrap();
                         0
                     );
                     assert_eq!(
-                        before["config"]["net"][0]["rate_limiter_config"]["rx"]["bandwidth"]["size"],
+                        before["config"]["net"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|net| net["id"] == "rate-data-net")
+                            .unwrap()["rate_limiter_config"]["rx"]["bandwidth"]["size"],
                         33554432
                     );
                     let snapshot = temp_snapshot_dir_path(&guest.tmp_dir);
@@ -11531,10 +11537,7 @@ PY"#).unwrap();
                         saved["rate_limit_groups"],
                         before["config"]["rate_limit_groups"]
                     );
-                    assert_eq!(
-                        saved["net"][0]["rate_limiter_config"],
-                        before["config"]["net"][0]["rate_limiter_config"]
-                    );
+                    assert_eq!(saved["net"], before["config"]["net"]);
                     child.kill().unwrap();
                     child.wait().unwrap();
                     let restored_api = format!("{api_socket}.restored");
@@ -11641,9 +11644,102 @@ for line in output.splitlines():
         stats[key] = int(value)
 print(json.dumps([stats[direction + '_queue_' + str(queue) + '_packets'] for direction in ('rx', 'tx') for queue in range(RATE_QUEUES)]))
 PY"#
-        .replace("RATE_MAC", &guest.network.guest_mac0)
+        .replace("RATE_MAC", &guest.network.guest_mac1)
         .replace("RATE_QUEUES", &queue_pairs.to_string());
         serde_json::from_str(&guest.ssh_command(&probe).unwrap()).unwrap()
+    }
+
+    fn live_rate_network_lifecycle(guest: &Guest, api_socket: &str) {
+        assert!(wait_until(Duration::from_secs(30), || {
+            let state = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            let net = live_rate_target(&state, "net", "rate-data-net");
+            net["rx"]["blocked"] == true && net["tx"]["blocked"] == true
+        }));
+        let queues_before = live_rate_queue_packets(guest, 2);
+        assert!(remote_command(api_socket, "pause", None));
+        let mut rx = live_rate_finite(1048576);
+        let mut tx = live_rate_finite(2097152);
+        // A reconstructed bucket would expose a large fresh burst before the
+        // stream could consume it. A retained owner cannot renew spent burst.
+        rx["bucket"]["one_time_burst"] = (1_u64 << 40).into();
+        tx["bucket"]["one_time_burst"] = (1_u64 << 40).into();
+        let state = live_rate_call(
+            api_socket,
+            "vm.rate-limits",
+            Some(serde_json::json!({
+                "target":"net", "id":"rate-data-net", "rx":rx, "tx":tx
+            })),
+        )
+        .unwrap();
+        let policy = live_rate_target(&state, "net", "rate-data-net").clone();
+        assert_eq!(policy["rx"]["bandwidth"]["burst"], 0);
+        assert_eq!(policy["tx"]["bandwidth"]["burst"], 0);
+        assert!(remote_command(api_socket, "resume", None));
+        let before = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+        assert!(wait_until(Duration::from_secs(30), || {
+            let after = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+            after.0 > before.0 + 65536 && after.1 > before.1 + 65536
+        }));
+        let queues_after = live_rate_queue_packets(guest, 2);
+        for (before, after) in queues_before.iter().zip(&queues_after) {
+            assert!(after > before);
+        }
+
+        let unbind = r#"sudo python3 - <<'PY'
+import pathlib, re
+cards = [p.parent for p in pathlib.Path('/sys/class/net').glob('*/address') if p.read_text().strip().lower() == 'RATE_MAC']
+assert len(cards) == 1, cards
+device = (cards[0] / 'device').resolve()
+pci = next(p for p in (device, *device.parents) if re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]', p.name))
+driver = (pci / 'driver').resolve()
+assert driver.name == 'virtio-pci', driver
+(driver / 'unbind').write_text(pci.name)
+print(pci.name)
+PY"#
+        .replace("RATE_MAC", &guest.network.guest_mac1);
+        let bdf = guest.ssh_command(&unbind).unwrap().trim().to_string();
+        assert!(wait_until(Duration::from_secs(30), || {
+            let state = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            live_rate_target(&state, "net", "rate-data-net")["active_queue_pairs"] == 0
+        }));
+        let reset = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+        let reset = live_rate_target(&reset, "net", "rate-data-net");
+        for direction in ["rx", "tx"] {
+            assert_eq!(
+                reset[direction]["bandwidth"]["policy"],
+                policy[direction]["bandwidth"]["policy"]
+            );
+            assert_eq!(reset[direction]["bandwidth"]["burst"], 0);
+        }
+        guest
+            .ssh_command(&format!(
+                "printf '%s' '{bdf}' | sudo tee /sys/bus/pci/drivers/virtio-pci/bind"
+            ))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            let state = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            let net = live_rate_target(&state, "net", "rate-data-net");
+            net["active_queue_pairs"] == 2 && net["unsupported_reason"].is_null()
+        }));
+        let restored = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+        let restored = live_rate_target(&restored, "net", "rate-data-net");
+        for direction in ["rx", "tx"] {
+            assert_eq!(
+                restored[direction]["bandwidth"]["policy"],
+                policy[direction]["bandwidth"]["policy"]
+            );
+            assert_eq!(restored[direction]["bandwidth"]["burst"], 0);
+        }
+        let queues_before = live_rate_queue_packets(guest, 2);
+        let before = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+        assert!(wait_until(Duration::from_secs(30), || {
+            let after = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+            after.0 > before.0 + 65536 && after.1 > before.1 + 65536
+        }));
+        let queues_after = live_rate_queue_packets(guest, 2);
+        for (before, after) in queues_before.iter().zip(&queues_after) {
+            assert!(after > before);
+        }
     }
 
     fn live_rate_network(queue_pairs: u32, low_udp: bool) {
@@ -11652,7 +11748,7 @@ PY"#
                 .ssh_command("cat /proc/sys/kernel/random/boot_id")
                 .unwrap();
             let pid = child.id();
-            let runtime = NET_RATE_LIMITER_RUNTIME * 4 + 60;
+            let runtime = NET_RATE_LIMITER_RUNTIME * 4 + if low_udp { 120 } else { 60 };
             let mut clients = LiveRateClients(Vec::new());
             for pair in 0..queue_pairs {
                 for (port, reverse) in [(5201 + pair * 2, false), (5202 + pair * 2, true)] {
@@ -11662,7 +11758,7 @@ PY"#
                     let mut command = Command::new("iperf3");
                     command.args([
                         "-c",
-                        &guest.network.guest_ip0,
+                        &guest.network.guest_ip1,
                         "-p",
                         &port.to_string(),
                         "-P",
@@ -11699,7 +11795,7 @@ PY"#
                 (33554432, 4194304)
             };
             let mut unlimited = None;
-            for policy in [None, Some(low), Some(high), None] {
+            for (phase, policy) in [None, Some(low), Some(high), None].into_iter().enumerate() {
                 let patch = match policy {
                     Some((rx, tx)) => {
                         let mut rx_policy = live_rate_finite(rx);
@@ -11755,6 +11851,9 @@ PY"#
                     assert_eq!(row["tx"]["bandwidth"]["policy"]["mode"], "unlimited");
                     assert!(measured.0 > high.0 as f64 * 1.2 && measured.1 > low.1 as f64 * 1.2);
                     unlimited = Some(measured);
+                }
+                if low_udp && phase == 1 {
+                    live_rate_network_lifecycle(guest, api_socket);
                 }
             }
             assert_eq!(child.id(), pid);
