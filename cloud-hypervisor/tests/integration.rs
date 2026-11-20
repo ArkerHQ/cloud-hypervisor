@@ -11238,6 +11238,682 @@ mod rate_limiter {
     const BLOCK_RATE_LIMITER_RUNTIME: u32 = 20;
     const BLOCK_RATE_LIMITER_RAMP_TIME: u32 = 5;
 
+    fn live_rate_call(
+        api_socket: &str,
+        command: &str,
+        update: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut socket = std::os::unix::net::UnixStream::connect(api_socket)?;
+        socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let body = update.map(|value| value.to_string());
+        let response = api_client::simple_api_full_command_and_response(
+            &mut socket,
+            if body.is_some() { "PUT" } else { "GET" },
+            command,
+            body.as_deref(),
+        )?
+        .ok_or("missing native API response")?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    fn live_rate_target<'a>(
+        response: &'a serde_json::Value,
+        target: &str,
+        id: &str,
+    ) -> &'a serde_json::Value {
+        response["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["target"] == target && row["id"] == id)
+            .unwrap()
+    }
+
+    fn live_rate_finite(size: u64) -> serde_json::Value {
+        serde_json::json!({"mode":"limited", "bucket":{"size":size, "one_time_burst":0, "refill_time":1000}})
+    }
+
+    fn with_live_rate_guest(
+        queue_pairs: u32,
+        extra_disks: &[String],
+        group: Option<&str>,
+        legacy_net: bool,
+        test: impl FnOnce(&Guest, &str, &mut Child),
+    ) {
+        let guest = Guest::new(Box::new(UbuntuDiskConfig::new(
+            JAMMY_IMAGE_NAME.to_string(),
+        )));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let mut net = format!(
+            "id=rate-data-net,tap=,mac={},ip={},mask=255.255.255.128,num_queues={},queue_size=256",
+            guest.network.guest_mac0,
+            guest.network.host_ip0,
+            queue_pairs * 2
+        );
+        if legacy_net {
+            net.push_str(",bw_size=1048576,bw_one_time_burst=0,bw_refill_time=1000");
+        }
+        let mut command = GuestCommand::new(&guest);
+        command
+            .args(["--cpus", &format!("boot={queue_pairs}")])
+            .args(["--memory", "size=1G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args([
+                "--disk",
+                &format!(
+                    "id=rate-boot-root,path={}",
+                    guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                ),
+                &format!(
+                    "id=rate-boot-seed,path={}",
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                ),
+            ]);
+        command.args(extra_disks);
+        command.args(["--net", &net, "--api-socket", &api_socket]);
+        if let Some(group) = group {
+            command.args(["--rate-limit-group", group]);
+        }
+        let mut child = command.capture_output().spawn().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(wait_until(Duration::from_secs(30), || {
+                let state = live_rate_call(&api_socket, "vm.rate-limits", None).unwrap();
+                live_rate_target(&state, "net", "rate-data-net")["active_queue_pairs"]
+                    == queue_pairs
+            }));
+            test(&guest, &api_socket, &mut child);
+        }));
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(result, &output);
+    }
+
+    #[test]
+    fn test_live_rate_identity_validation_and_failed_device() {
+        let image = TempFile::new().unwrap();
+        image.as_file().set_len(1024 * 1024 * 1024).unwrap();
+        let disk = format!(
+            "id=rate-data-disk,path={},serial=rate-proof-data,image_type=raw,num_queues=2",
+            image.as_path().to_str().unwrap()
+        );
+        with_live_rate_guest(2, &[disk], None, false, |guest, api_socket, child| {
+            let pid = child.id();
+            let boot = guest
+                .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                .unwrap();
+            let state = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            assert_eq!(
+                live_rate_target(&state, "disk", "rate-data-disk")["active_queues"],
+                2
+            );
+            for invalid in [
+                serde_json::json!({"target":"net", "id":"rate-data-disk", "rx":{"mode":"unlimited"}}),
+                serde_json::json!({"target":"disk", "id":"missing-device", "bandwidth":{"mode":"unlimited"}}),
+                serde_json::json!({"target":"net", "id":"rate-data-net", "rx":live_rate_finite(1048576), "tx":{"mode":"limited", "bucket":{"size":0,"refill_time":1000}}}),
+                serde_json::json!({"target":"net", "id":"rate-data-net", "rx":null}),
+            ] {
+                live_rate_call(api_socket, "vm.rate-limits", Some(invalid)).unwrap_err();
+            }
+            let unchanged = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            assert_eq!(
+                live_rate_target(&unchanged, "net", "rate-data-net")["rx"]["bandwidth"]["policy"]["mode"],
+                "unlimited"
+            );
+            let updated = live_rate_call(
+                api_socket,
+                "vm.rate-limits",
+                Some(serde_json::json!({
+                    "target":"disk", "id":"rate-data-disk", "bandwidth":live_rate_finite(1048576)
+                })),
+            )
+            .unwrap();
+            let policy = live_rate_target(&updated, "disk", "rate-data-disk")["limiter"]["bandwidth"]["policy"].clone();
+            guest.ssh_command(r#"sudo python3 - <<'PY'
+import mmap, os, pathlib, re, struct
+serials = [p for p in pathlib.Path('/sys/class/block').glob('*/serial') if p.read_text().strip() == 'rate-proof-data']
+assert len(serials) == 1, serials
+parents = (serials[0].parent / 'device').resolve().parents
+bdf = next(p.name for p in parents if re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]', p.name))
+pci = pathlib.Path('/sys/bus/pci/devices') / bdf
+config = (pci / 'config').read_bytes()
+cap = config[0x34]
+seen = set()
+while cap and cap not in seen:
+    seen.add(cap)
+    if config[cap] == 9 and config[cap + 3] == 1:
+        bar = config[cap + 4]
+        offset = struct.unpack_from('<I', config, cap + 8)[0]
+        fd = os.open(pci / ('resource' + str(bar)), os.O_RDWR | os.O_SYNC)
+        try:
+            with mmap.mmap(fd, mmap.PAGESIZE, offset=offset // mmap.PAGESIZE * mmap.PAGESIZE) as common:
+                status = offset % mmap.PAGESIZE + 0x14
+                common[status] = common[status] | 0x80
+        finally:
+            os.close(fd)
+        print(bdf)
+        break
+    cap = config[cap + 1]
+else:
+    raise RuntimeError('no virtio common capability')
+PY"#).unwrap();
+            let failed = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            assert_eq!(
+                live_rate_target(&failed, "disk", "rate-data-disk")["unsupported_reason"],
+                "device_needs_reset"
+            );
+            live_rate_call(
+                api_socket,
+                "vm.rate-limits",
+                Some(serde_json::json!({
+                    "target":"disk", "id":"rate-data-disk", "bandwidth":{"mode":"unlimited"}
+                })),
+            )
+            .unwrap_err();
+            let failed = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            assert_eq!(
+                live_rate_target(&failed, "disk", "rate-data-disk")["limiter"]["bandwidth"]["policy"],
+                policy
+            );
+            assert_eq!(child.id(), pid);
+            assert_eq!(
+                guest
+                    .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                    .unwrap(),
+                boot
+            );
+        });
+    }
+
+    #[test]
+    fn test_live_rate_finite_legacy_network_refuses_conversion() {
+        with_live_rate_guest(2, &[], None, true, |guest, api_socket, _| {
+            let boot = guest
+                .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                .unwrap();
+            let state = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+            assert_eq!(
+                live_rate_target(&state, "net", "rate-data-net")["unsupported_reason"],
+                "legacy_per_queue_config"
+            );
+            let before = live_rate_call(api_socket, "vm.info", None).unwrap();
+            live_rate_call(
+                api_socket,
+                "vm.rate-limits",
+                Some(serde_json::json!({
+                    "target":"net", "id":"rate-data-net", "rx":{"mode":"unlimited"}
+                })),
+            )
+            .unwrap_err();
+            let after = live_rate_call(api_socket, "vm.info", None).unwrap();
+            assert_eq!(before["config"]["net"], after["config"]["net"]);
+            assert_eq!(
+                guest
+                    .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                    .unwrap(),
+                boot
+            );
+        });
+    }
+
+    #[test]
+    fn test_live_rate_shared_group_and_aggregate_snapshot_restore() {
+        for paused_capture in [false, true] {
+            let first = TempFile::new().unwrap();
+            let second = TempFile::new().unwrap();
+            first.as_file().set_len(1024 * 1024 * 1024).unwrap();
+            second.as_file().set_len(1024 * 1024 * 1024).unwrap();
+            let disks = [
+                format!(
+                    "id=rate-data-one,path={},image_type=raw,num_queues=2,rate_limit_group=rate-shared",
+                    first.as_path().to_str().unwrap()
+                ),
+                format!(
+                    "id=rate-data-two,path={},image_type=raw,num_queues=2,rate_limit_group=rate-shared",
+                    second.as_path().to_str().unwrap()
+                ),
+            ];
+            with_live_rate_guest(
+                2,
+                &disks,
+                Some("id=rate-shared,bw_size=1048576,bw_one_time_burst=0,bw_refill_time=1000"),
+                false,
+                |guest, api_socket, child| {
+                    let boot = guest
+                        .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                        .unwrap();
+                    let state = live_rate_call(api_socket, "vm.rate-limits", None).unwrap();
+                    assert_eq!(
+                        live_rate_target(&state, "block_group", "rate-shared")["members"],
+                        serde_json::json!(["rate-data-one", "rate-data-two"])
+                    );
+                    let error = live_rate_call(
+                        api_socket,
+                        "vm.rate-limits",
+                        Some(serde_json::json!({
+                            "target":"disk", "id":"rate-data-one", "bandwidth":{"mode":"unlimited"}
+                        })),
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains("rate-shared"));
+                    live_rate_call(api_socket, "vm.rate-limits", Some(serde_json::json!({
+                        "target":"net", "id":"rate-data-net", "rx":live_rate_finite(33554432), "tx":{"mode":"unlimited"}
+                    }))).unwrap();
+                    live_rate_call(api_socket, "vm.rate-limits", Some(serde_json::json!({
+                        "target":"block_group", "id":"rate-shared", "bandwidth":{"mode":"unlimited"}
+                    }))).unwrap();
+                    let before = live_rate_call(api_socket, "vm.info", None).unwrap();
+                    assert_eq!(
+                        before["config"]["rate_limit_groups"][0]["rate_limiter_config"]["bandwidth"]
+                            ["size"],
+                        0
+                    );
+                    assert_eq!(
+                        before["config"]["net"][0]["rate_limiter_config"]["rx"]["bandwidth"]["size"],
+                        33554432
+                    );
+                    let snapshot = temp_snapshot_dir_path(&guest.tmp_dir);
+                    if paused_capture {
+                        assert!(remote_command(api_socket, "pause", None));
+                    }
+                    assert!(remote_command(
+                        api_socket,
+                        "snapshot",
+                        Some(&format!("file://{snapshot}"))
+                    ));
+                    let saved: serde_json::Value = serde_json::from_slice(
+                        &fs::read(std::path::Path::new(&snapshot).join("config.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        saved["rate_limit_groups"],
+                        before["config"]["rate_limit_groups"]
+                    );
+                    assert_eq!(
+                        saved["net"][0]["rate_limiter_config"],
+                        before["config"]["net"][0]["rate_limiter_config"]
+                    );
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    let restored_api = format!("{api_socket}.restored");
+                    *child = GuestCommand::new(guest)
+                        .args(["--api-socket", &restored_api])
+                        .args(["--restore", &format!("source_url=file://{snapshot}")])
+                        .capture_output()
+                        .spawn()
+                        .unwrap();
+                    assert!(wait_until(Duration::from_secs(30), || live_rate_call(
+                        &restored_api,
+                        "vm.info",
+                        None
+                    )
+                    .is_ok()));
+                    assert!(remote_command(&restored_api, "resume", None));
+                    assert_eq!(
+                        guest
+                            .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                            .unwrap(),
+                        boot
+                    );
+                    let restored = live_rate_call(&restored_api, "vm.rate-limits", None).unwrap();
+                    assert_eq!(
+                        live_rate_target(&restored, "net", "rate-data-net")["rx"]["bandwidth"]["policy"]
+                            ["bucket"]["size"],
+                        33554432
+                    );
+                    assert_eq!(
+                        live_rate_target(&restored, "block_group", "rate-shared")["limiter"]["bandwidth"]
+                            ["policy"]["mode"],
+                        "unlimited"
+                    );
+                    assert_eq!(
+                        live_rate_target(&restored, "block_group", "rate-shared")["members"],
+                        serde_json::json!(["rate-data-one", "rate-data-two"])
+                    );
+                    assert!(remote_command(
+                        &restored_api,
+                        "remove-device",
+                        Some("rate-data-two")
+                    ));
+                    assert!(wait_until(Duration::from_secs(30), || {
+                        let state = live_rate_call(&restored_api, "vm.rate-limits", None).unwrap();
+                        live_rate_target(&state, "block_group", "rate-shared")["members"]
+                            == serde_json::json!(["rate-data-one"])
+                    }));
+                    live_rate_call(
+                        &restored_api,
+                        "vm.rate-limits",
+                        Some(serde_json::json!({
+                            "target":"disk", "id":"rate-data-two", "bandwidth":{"mode":"unlimited"}
+                        })),
+                    )
+                    .unwrap_err();
+                    assert!(remote_command(&restored_api, "add-disk", Some(&disks[1])));
+                    assert!(wait_until(Duration::from_secs(30), || {
+                        let state = live_rate_call(&restored_api, "vm.rate-limits", None).unwrap();
+                        live_rate_target(&state, "block_group", "rate-shared")["members"]
+                            == serde_json::json!(["rate-data-one", "rate-data-two"])
+                    }));
+                    let state = live_rate_call(&restored_api, "vm.rate-limits", Some(serde_json::json!({
+                        "target":"block_group", "id":"rate-shared", "bandwidth":live_rate_finite(2097152)
+                    }))).unwrap();
+                    assert_eq!(
+                        live_rate_target(&state, "block_group", "rate-shared")["limiter"]["bandwidth"]
+                            ["policy"]["bucket"]["size"],
+                        2097152
+                    );
+                },
+            );
+        }
+    }
+
+    struct LiveRateClients(Vec<Child>);
+
+    impl Drop for LiveRateClients {
+        fn drop(&mut self) {
+            for client in &mut self.0 {
+                let _ = client.kill();
+                let _ = client.wait();
+            }
+        }
+    }
+
+    fn live_rate_bytes(api_socket: &str, id: &str, first: &str, second: &str) -> (u64, u64) {
+        let value = live_rate_call(api_socket, "vm.counters", None).unwrap();
+        (
+            value[id][first].as_u64().unwrap(),
+            value[id][second].as_u64().unwrap(),
+        )
+    }
+
+    fn live_rate_queue_packets(guest: &Guest, queue_pairs: u32) -> Vec<u64> {
+        let probe = r#"python3 - <<'PY'
+import json, pathlib, subprocess
+cards = [p.parent for p in pathlib.Path('/sys/class/net').glob('*/address') if p.read_text().strip().lower() == 'RATE_MAC']
+assert len(cards) == 1, cards
+output = subprocess.check_output(['ethtool', '-S', cards[0].name], text=True)
+stats = {}
+for line in output.splitlines():
+    key, sep, value = line.strip().partition(':')
+    if sep and value.strip().isdigit():
+        stats[key] = int(value)
+print(json.dumps([stats[direction + '_queue_' + str(queue) + '_packets'] for direction in ('rx', 'tx') for queue in range(RATE_QUEUES)]))
+PY"#
+        .replace("RATE_MAC", &guest.network.guest_mac0)
+        .replace("RATE_QUEUES", &queue_pairs.to_string());
+        serde_json::from_str(&guest.ssh_command(&probe).unwrap()).unwrap()
+    }
+
+    fn live_rate_network(queue_pairs: u32, low_udp: bool) {
+        with_live_rate_guest(queue_pairs, &[], None, false, |guest, api_socket, child| {
+            let boot = guest
+                .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                .unwrap();
+            let pid = child.id();
+            let runtime = NET_RATE_LIMITER_RUNTIME * 4 + 60;
+            let mut clients = LiveRateClients(Vec::new());
+            for pair in 0..queue_pairs {
+                for (port, reverse) in [(5201 + pair * 2, false), (5202 + pair * 2, true)] {
+                    guest
+                        .ssh_command(&format!("taskset -c {pair} iperf3 -s -p {port} -D"))
+                        .unwrap();
+                    let mut command = Command::new("iperf3");
+                    command.args([
+                        "-c",
+                        &guest.network.guest_ip0,
+                        "-p",
+                        &port.to_string(),
+                        "-P",
+                        "8",
+                        "-t",
+                        &runtime.to_string(),
+                        "-J",
+                        "-i",
+                        "0",
+                    ]);
+                    if reverse {
+                        command.arg("-R");
+                    }
+                    if low_udp {
+                        command.args(["-u", "-b", "100M"]);
+                    }
+                    command.stdout(Stdio::null()).stderr(Stdio::inherit());
+                    clients.0.push(command.spawn().unwrap());
+                }
+            }
+            let initial = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+            assert!(wait_until(Duration::from_secs(30), || {
+                let current = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+                current.0 > initial.0 + 65536 && current.1 > initial.1 + 65536
+            }));
+            let low = if low_udp {
+                (4096, 8192)
+            } else {
+                (16777216, 8388608)
+            };
+            let high = if low_udp {
+                (8192, 4096)
+            } else {
+                (33554432, 4194304)
+            };
+            let mut unlimited = None;
+            for policy in [None, Some(low), Some(high), None] {
+                let patch = match policy {
+                    Some((rx, tx)) => {
+                        let mut rx_policy = live_rate_finite(rx);
+                        let mut tx_policy = live_rate_finite(tx);
+                        rx_policy["bucket"]["one_time_burst"] = rx.into();
+                        tx_policy["bucket"]["one_time_burst"] = tx.into();
+                        serde_json::json!({"target":"net", "id":"rate-data-net", "rx":rx_policy,"tx":tx_policy})
+                    }
+                    None => {
+                        serde_json::json!({"target":"net", "id":"rate-data-net", "rx":{"mode":"unlimited"},"tx":{"mode":"unlimited"}})
+                    }
+                };
+                let state =
+                    live_rate_call(api_socket, "vm.rate-limits", Some(patch.clone())).unwrap();
+                let row = live_rate_target(&state, "net", "rate-data-net");
+                assert_eq!(row["queue_pairs"], queue_pairs);
+                assert_eq!(row["active_queue_pairs"], queue_pairs);
+                assert!(row["unsupported_reason"].is_null());
+                let queues_before = live_rate_queue_packets(guest, queue_pairs);
+                let before = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+                let start = std::time::Instant::now();
+                for _ in 0..NET_RATE_LIMITER_RUNTIME {
+                    thread::sleep(Duration::from_secs(1));
+                    // Identical reapply during an active stream cannot keep the burst alive.
+                    live_rate_call(api_socket, "vm.rate-limits", Some(patch.clone())).unwrap();
+                    for client in &mut clients.0 {
+                        assert!(client.try_wait().unwrap().is_none());
+                    }
+                }
+                let after = live_rate_bytes(api_socket, "rate-data-net", "rx_bytes", "tx_bytes");
+                let seconds = start.elapsed().as_secs_f64();
+                let measured = (
+                    (after.0 - before.0) as f64 / seconds,
+                    (after.1 - before.1) as f64 / seconds,
+                );
+                let queues_after = live_rate_queue_packets(guest, queue_pairs);
+                assert_eq!(queues_after.len(), queues_before.len());
+                for (before, after) in queues_before.iter().zip(&queues_after) {
+                    assert!(
+                        after > before,
+                        "inactive queue: {queues_before:?} -> {queues_after:?}"
+                    );
+                }
+                if let Some((rx, tx)) = policy {
+                    assert_eq!(row["rx"]["bandwidth"]["policy"]["bucket"]["size"], rx);
+                    assert_eq!(row["tx"]["bandwidth"]["policy"]["bucket"]["size"], tx);
+                    assert!(check_rate_limit(measured.0, rx as f64, 0.2));
+                    assert!(check_rate_limit(measured.1, tx as f64, 0.2));
+                    let baseline: (f64, f64) = unlimited.unwrap();
+                    assert!(baseline.0 > rx as f64 * 1.2 && baseline.1 > tx as f64 * 1.2);
+                } else {
+                    assert_eq!(row["rx"]["bandwidth"]["policy"]["mode"], "unlimited");
+                    assert_eq!(row["tx"]["bandwidth"]["policy"]["mode"], "unlimited");
+                    assert!(measured.0 > high.0 as f64 * 1.2 && measured.1 > low.1 as f64 * 1.2);
+                    unlimited = Some(measured);
+                }
+            }
+            assert_eq!(child.id(), pid);
+            assert_eq!(
+                guest
+                    .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                    .unwrap(),
+                boot
+            );
+        });
+    }
+
+    #[test]
+    fn test_live_rate_network_single_queue() {
+        live_rate_network(1, false);
+    }
+
+    #[test]
+    fn test_live_rate_network_multiple_queues() {
+        live_rate_network(2, false);
+    }
+
+    #[test]
+    fn test_live_rate_network_low_bucket_multiple_queues() {
+        live_rate_network(2, true);
+    }
+
+    fn live_rate_block(queues: u32, shared: bool) {
+        let first = TempFile::new().unwrap();
+        let second = TempFile::new().unwrap();
+        first.as_file().set_len(1024 * 1024 * 1024).unwrap();
+        second.as_file().set_len(1024 * 1024 * 1024).unwrap();
+        let group_suffix = if shared {
+            ",rate_limit_group=rate-shared"
+        } else {
+            ""
+        };
+        let mut disks = vec![format!(
+            "id=rate-data-one,path={},image_type=raw,num_queues={queues}{group_suffix}",
+            first.as_path().to_str().unwrap()
+        )];
+        if shared {
+            disks.push(format!(
+                "id=rate-data-two,path={},image_type=raw,num_queues={queues}{group_suffix}",
+                second.as_path().to_str().unwrap()
+            ));
+        }
+        let group = shared
+            .then_some("id=rate-shared,bw_size=1048576,bw_one_time_burst=0,bw_refill_time=1000");
+        with_live_rate_guest(queues, &disks, group, false, |guest, api_socket, child| {
+            let boot = guest
+                .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                .unwrap();
+            let pid = child.id();
+            let target = if shared { "block_group" } else { "disk" };
+            let id = if shared {
+                "rate-shared"
+            } else {
+                "rate-data-one"
+            };
+            live_rate_call(
+                api_socket,
+                "vm.rate-limits",
+                Some(serde_json::json!({
+                    "target":target, "id":id, "bandwidth":{"mode":"unlimited"}
+                })),
+            )
+            .unwrap();
+            let runtime = BLOCK_RATE_LIMITER_RUNTIME * 4 + 60;
+            let mut fio = format!(
+                "nohup sudo fio --name=global --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 --rw=randrw --time_based --runtime={runtime} --numjobs={queues} --cpus_allowed=0-{} --cpus_allowed_policy=split --output-format=json --output=/tmp/rate-fio.json",
+                queues - 1
+            );
+            fio.push_str(" --name=rate-one --filename=/dev/vdc");
+            if shared {
+                fio.push_str(" --name=rate-two --filename=/dev/vdd");
+            }
+            fio.push_str(" >/tmp/rate-fio.log 2>&1 </dev/null & echo $!");
+            let fio_pid = guest
+                .ssh_command(&fio)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            let bytes = || {
+                let state = live_rate_call(api_socket, "vm.counters", None).unwrap();
+                let mut total = state["rate-data-one"]["read_bytes"].as_u64().unwrap()
+                    + state["rate-data-one"]["write_bytes"].as_u64().unwrap();
+                if shared {
+                    total += state["rate-data-two"]["read_bytes"].as_u64().unwrap()
+                        + state["rate-data-two"]["write_bytes"].as_u64().unwrap();
+                }
+                total
+            };
+            assert!(wait_until(Duration::from_secs(30), || bytes() > 65536));
+            let mut baseline = None;
+            for rate in [None, Some(16777216_u64), Some(33554432), None] {
+                let policy =
+                    rate.map_or_else(|| serde_json::json!({"mode":"unlimited"}), live_rate_finite);
+                let state = live_rate_call(
+                    api_socket,
+                    "vm.rate-limits",
+                    Some(serde_json::json!({
+                        "target":target, "id":id, "bandwidth":policy
+                    })),
+                )
+                .unwrap();
+                let owner = live_rate_target(&state, target, id);
+                if shared {
+                    assert_eq!(
+                        owner["members"],
+                        serde_json::json!(["rate-data-one", "rate-data-two"])
+                    );
+                    assert_eq!(owner["failed_members"], serde_json::json!([]));
+                } else {
+                    assert_eq!(owner["active_queues"], queues);
+                }
+                let before = bytes();
+                let start = std::time::Instant::now();
+                thread::sleep(Duration::from_secs(u64::from(BLOCK_RATE_LIMITER_RUNTIME)));
+                let measured = (bytes() - before) as f64 / start.elapsed().as_secs_f64();
+                guest
+                    .ssh_command(&format!("sudo kill -0 {fio_pid}"))
+                    .unwrap();
+                if let Some(rate) = rate {
+                    assert_eq!(
+                        owner["limiter"]["bandwidth"]["policy"]["bucket"]["size"],
+                        rate
+                    );
+                    assert!(check_rate_limit(measured, rate as f64, 0.2));
+                    assert!(baseline.unwrap() > rate as f64 * 1.2);
+                } else {
+                    assert_eq!(owner["limiter"]["bandwidth"]["policy"]["mode"], "unlimited");
+                    assert!(measured > 33554432_f64 * 1.2);
+                    baseline = Some(measured);
+                }
+            }
+            assert_eq!(child.id(), pid);
+            assert_eq!(
+                guest
+                    .ssh_command("cat /proc/sys/kernel/random/boot_id")
+                    .unwrap(),
+                boot
+            );
+        });
+    }
+
+    #[test]
+    fn test_live_rate_block_single_and_multiple_queues() {
+        live_rate_block(1, false);
+        live_rate_block(2, false);
+    }
+
+    #[test]
+    fn test_live_rate_shared_block_single_and_multiple_queues() {
+        live_rate_block(1, true);
+        live_rate_block(2, true);
+    }
+
     // Check if the 'measured' rate is within the expected 'difference' (in percentage)
     // compared to given 'limit' rate.
     fn check_rate_limit(measured: f64, limit: f64, difference: f64) -> bool {
