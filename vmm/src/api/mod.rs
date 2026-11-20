@@ -542,7 +542,7 @@ pub enum BandwidthPatch {
     #[default]
     #[serde(skip)]
     Unchanged,
-    Unlimited,
+    Unlimited {},
     Limited {
         bucket: LiveBucketConfig,
     },
@@ -566,7 +566,7 @@ impl BandwidthPatch {
     ) -> Result<bool, rate_limiter::group::Error> {
         match self {
             Self::Unchanged => Ok(false),
-            Self::Unlimited => group.update_bandwidth(None),
+            Self::Unlimited {} => group.update_bandwidth(None),
             Self::Limited { bucket } => group.update_bandwidth(Some((*bucket).into())),
         }
     }
@@ -633,7 +633,7 @@ impl From<rate_limiter::BucketState> for EffectiveBucket {
         Self {
             policy: value
                 .configured
-                .map_or(BandwidthPatch::Unlimited, |bucket| {
+                .map_or(BandwidthPatch::Unlimited {}, |bucket| {
                     BandwidthPatch::Limited {
                         bucket: bucket.into(),
                     }
@@ -2023,7 +2023,7 @@ mod unit_tests {
         assert!(matches!(
             explicit,
             VmRateLimitsRequest::Net {
-                rx: BandwidthPatch::Unlimited,
+                rx: BandwidthPatch::Unlimited {},
                 tx: BandwidthPatch::Unchanged,
                 ..
             }
