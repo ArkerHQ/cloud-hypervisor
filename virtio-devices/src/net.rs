@@ -251,13 +251,13 @@ impl NetEpollHandler {
             .as_ref()
             .is_some_and(|r| r.is_blocked());
 
-        if !rate_limit_reached {
-            self.process_tx()?;
-        } else {
+        if rate_limit_reached {
             // A peer queue can block this group while TAP write readiness is pending.
             self.net
                 .set_tx_tap_retry(false)
                 .map_err(DeviceError::NetQueuePair)?;
+        } else {
+            self.process_tx()?;
         }
 
         Ok(())
