@@ -27,7 +27,7 @@ use linux_loader::loader::bootparam::{boot_params, setup_header};
 use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
 };
-use log::{debug, error, info};
+use log::{error, info};
 use thiserror::Error;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
@@ -879,8 +879,6 @@ pub fn configure_vcpu(
             });
         }
     }
-
-    debug!("Setting {} guest CPUID entries", cpuid.len());
 
     vcpu.set_cpuid2(&cpuid)
         .map_err(|e| Error::SetSupportedCpusFailed(e.into()))?;
