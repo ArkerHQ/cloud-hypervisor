@@ -5,6 +5,8 @@ on:
     paths: resources/Dockerfile
   pull_request:
     paths: resources/Dockerfile
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
@@ -16,6 +18,9 @@ env:
 jobs:
   main:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Code checkout
         uses: actions/checkout@v6
