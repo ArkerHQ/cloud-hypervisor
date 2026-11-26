@@ -880,9 +880,7 @@ pub fn configure_vcpu(
         }
     }
 
-    for c in &cpuid {
-        debug!("{c}");
-    }
+    debug!("Setting {} guest CPUID entries", cpuid.len());
 
     vcpu.set_cpuid2(&cpuid)
         .map_err(|e| Error::SetSupportedCpusFailed(e.into()))?;

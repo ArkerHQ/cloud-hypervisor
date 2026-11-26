@@ -274,7 +274,7 @@ impl CpuStateManager for EmulatorCpuState {
             )));
         };
 
-        debug!("Register read: {reg_value:#x} from {reg:?}");
+        debug!("Register read from {reg:?}");
 
         Ok(reg_value)
     }
