@@ -559,10 +559,6 @@ pub fn generate_common_cpuid(
     hypervisor: &dyn hypervisor::Hypervisor,
     config: &CpuidConfig,
 ) -> super::Result<Vec<CpuIdEntry>> {
-    info!(
-        "Generating guest CPUID for with physical address size: {}",
-        config.phys_bits
-    );
     #[allow(unused_mut)]
     let mut cpuid_patches = vec![
         // Patch hypervisor bit
