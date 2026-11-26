@@ -1,5 +1,7 @@
 name: Cloud Hypervisor Release
 on: [create, merge_group]
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
@@ -27,6 +29,9 @@ jobs:
           name_ch: cloud-hypervisor-static-aarch64
           name_ch_remote: ch-remote-static-aarch64
     runs-on: ubuntu-latest
+    permissions:
+      # softprops/action-gh-release creates the draft release.
+      contents: write
     steps:
       - name: Code checkout
         uses: actions/checkout@v6

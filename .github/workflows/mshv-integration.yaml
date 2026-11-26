@@ -1,5 +1,8 @@
 name: Cloud Hypervisor Tests (MSHV) (x86_64)
-on: [pull_request_target, merge_group]
+# pull_request (not pull_request_target): this job builds and runs PR code on a
+# self-hosted runner with Azure secrets, so it must not run with the base
+# repo's privileges for untrusted fork PRs.
+on: [pull_request, merge_group]
 permissions: {}
 
 jobs:
@@ -43,7 +46,7 @@ jobs:
             echo "Logged in successfully."
             export PATH="\$HOME/.cargo/bin:\$PATH"
 
-            if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
               git clone --depth 1 "$REPO_URL" "$REPO_DIR"
               cd "$REPO_DIR"
               git fetch origin pull/${{ github.event.pull_request.number }}/merge
