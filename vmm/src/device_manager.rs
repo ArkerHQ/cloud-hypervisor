@@ -4474,7 +4474,6 @@ impl DeviceManager {
         // the device is being restored, otherwise it's created from scratch.
         let (pci_device_bdf, resources) =
             if let Some(node) = self.device_tree.lock().unwrap().get(id) {
-                info!("Restoring virtio-pci {id} resources");
                 let pci_device_bdf: PciBdf = node
                     .pci_bdf
                     .ok_or(DeviceManagerError::MissingDeviceNodePciBdf)?;
