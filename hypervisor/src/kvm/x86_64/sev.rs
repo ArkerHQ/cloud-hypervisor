@@ -282,7 +282,7 @@ impl SevFd {
         };
         let flags = finish.flags;
         debug!(
-            "KVM_SEV_SNP_LAUNCH_FINISH: id_block_en={id_block_en}, auth_key_en={auth_key_en}, policy={guest_policy:#x}, flags={flags}"
+            "KVM_SEV_SNP_LAUNCH_FINISH: policy={guest_policy:#x}, flags={flags}"
         );
         sev_op(vm, &mut sev_cmd, "KVM_SEV_SNP_LAUNCH_FINISH")
     }

@@ -843,8 +843,8 @@ impl cpu::Vcpu for MshvVcpu {
                 }
                 #[cfg(target_arch = "x86_64")]
                 hv_message_type_HVMSG_X64_CPUID_INTERCEPT => {
-                    let info = x.to_cpuid_info().unwrap();
-                    debug!("cpuid eax: {:x}", { info.rax });
+                    let _ = x.to_cpuid_info().unwrap();
+                    debug!("CPUID intercept");
                     Ok(cpu::VmExit::Ignore)
                 }
                 #[cfg(target_arch = "x86_64")]
@@ -1229,7 +1229,7 @@ impl cpu::Vcpu for MshvVcpu {
                                     let xcr0 = unsafe { (*ghcb).xfem };
                                     // SAFETY: Accessing fields from the mapped GHCB page
                                     let xss = unsafe { (*ghcb).xss };
-                                    debug!("GHCB CPUID: fn=0x{cpuid_fn:x} idx=0x{cpuid_idx:x}");
+                                    debug!("GHCB CPUID request");
 
                                     let cpuid_result = self
                                         .fd
